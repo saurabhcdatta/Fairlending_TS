@@ -96,24 +96,38 @@ source_path <- function(year, cfg) {
 #' Read one source file; dispatch on extension (.dta Stata / .sas7bdat SAS).
 #' Replaces the SAS PROC IMPORT stage: raw Stata is read directly, so the
 #' .dta -> sas7bdat hop (and its duplicate disk copy) is eliminated.
-#' n_max = 0 gives a header-only read for schema scans. col_select prunes
-#' columns AT the read (haven only parses selected columns), which cuts the
-#' network transfer/parse cost when the parquet panel need not be a full
-#' archive; any_of() tolerates columns absent in a given year.
-read_source <- function(path, n_max = Inf, col_select = NULL) {
+#' `skip` + `n_max` enable chunked reads of national-scale files.
+#' QUIRK: for .dta, ReadStat treats row_limit = 0 as NO LIMIT, so a naive
+#' n_max = 0 "header scan" reads the ENTIRE file (OOM on big years). We
+#' therefore floor header scans at one row.
+#' col_select prunes columns AT the read; any_of() tolerates absent columns.
+read_source <- function(path, n_max = Inf, col_select = NULL, skip = 0) {
   ext <- tolower(tools::file_ext(path))
+  if (n_max == 0) n_max <- 1   # ReadStat row_limit-0 = unlimited; see QUIRK
   if (ext == "dta") {
-    df <- if (is.null(col_select)) haven::read_dta(path, n_max = n_max)
-          else haven::read_dta(path, n_max = n_max,
-                               col_select = tidyselect::any_of(col_select))
+    df <- if (is.null(col_select))
+      haven::read_dta(path, n_max = n_max, skip = skip)
+    else
+      haven::read_dta(path, n_max = n_max, skip = skip,
+                      col_select = tidyselect::any_of(col_select))
     haven::zap_formats(haven::zap_labels(df))   # plain vectors, not labelled
   }
   else if (ext == "sas7bdat") {
-    if (is.null(col_select)) haven::read_sas(path, n_max = n_max)
-    else haven::read_sas(path, n_max = n_max,
-                         col_select = tidyselect::any_of(col_select))
+    if (is.null(col_select))
+      haven::read_sas(path, n_max = n_max, skip = skip)
+    else
+      haven::read_sas(path, n_max = n_max, skip = skip,
+                      col_select = tidyselect::any_of(col_select))
   }
   else stop("Unsupported source format: ", path)
+}
+
+#' Parquet writer wrapper (separable so tests can override the writer).
+.write_parquet <- function(df, path, cfg) {
+  arrow::write_parquet(df, path,
+                       compression       = cfg$build$compression,
+                       compression_level = cfg$build$compression_level,
+                       use_dictionary    = TRUE)
 }
 
 # ---- typing helpers ----------------------------------------------------------
@@ -179,29 +193,48 @@ harmonize_year <- function(dt, year) {
 }
 
 # ---- atomic per-year conversion (v2 convert_one, hive-partitioned) ----------
+# ---- chunked per-year conversion (streams national-scale files) -------------
+# all_agency files run ~15M+ rows/year; a single read_dta() of a full year is
+# 20-40GB in R and OOMs a 32GB machine. We therefore stream in chunks of
+# cfg$build$chunk_rows: read chunk -> harmonize -> write part-<i>.parquet
+# (atomic tmp+rename) -> free -> next. A ".complete" marker written after the
+# last chunk is the skip/resume signal; a crashed year has no marker and is
+# rebuilt cleanly. Peak RAM ~ one chunk, regardless of file size.
 convert_one_year <- function(year, cfg) {
   t0   <- Sys.time()
   f    <- source_path(year, cfg)
   pdir <- file.path(cfg$paths$parquet_dir, paste0("data_year=", year))
-  out  <- file.path(pdir, "part-0.parquet")
+  marker <- file.path(pdir, ".complete")
 
-  if (file.exists(out) && !isTRUE(cfg$build$overwrite))
+  if (file.exists(marker) && !isTRUE(cfg$build$overwrite))
     return(list(year = year, status = "skipped", rows = NA_integer_,
                 seconds = 0, error = NA_character_))
 
   tryCatch({
-    dt <- read_source(f, col_select = cfg$build$col_select)
-    dt <- harmonize_year(dt, year)
-    n  <- nrow(dt)
+    if (dir.exists(pdir)) unlink(pdir, recursive = TRUE)  # clear partials
     dir.create(pdir, recursive = TRUE, showWarnings = FALSE)
-    tmp <- paste0(out, ".tmp")
-    arrow::write_parquet(dt, tmp,
-                         compression       = cfg$build$compression,
-                         compression_level = cfg$build$compression_level,
-                         use_dictionary    = TRUE)
-    file.rename(tmp, out)
-    rm(dt); gc()
-    list(year = year, status = "ok", rows = n,
+    chunk <- cfg$build$chunk_rows
+    if (is.null(chunk) || !is.finite(chunk)) chunk <- Inf
+
+    total <- 0L; i <- 0L
+    repeat {
+      dt <- read_source(f, n_max = chunk, skip = total,
+                        col_select = cfg$build$col_select)
+      n <- nrow(dt)
+      if (n == 0L) { rm(dt); break }
+      dt  <- harmonize_year(as.data.table(dt), year)
+      out <- file.path(pdir, sprintf("part-%d.parquet", i))
+      tmp <- paste0(out, ".tmp")
+      .write_parquet(dt, tmp, cfg)
+      file.rename(tmp, out)
+      total <- total + n; i <- i + 1L
+      log_info("  ", year, " chunk ", i, ": +", format(n, big.mark = ","),
+               " rows (cum ", format(total, big.mark = ","), ")")
+      rm(dt); gc()
+      if (n < chunk) break          # short chunk = end of file
+    }
+    writeLines(as.character(total), marker)
+    list(year = year, status = "ok", rows = total,
          seconds = as.numeric(difftime(Sys.time(), t0, units = "secs")),
          error = NA_character_)
   }, error = function(e) {
