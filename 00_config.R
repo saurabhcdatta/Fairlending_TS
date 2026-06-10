@@ -70,6 +70,16 @@ cfg$raw_files <- c(
                      "all_agency_hmda_2025_05_31_2026_final.dta")
 )
 
+# Per-year source overrides. Use when a specific year's raw .dta cannot be
+# parsed (e.g. ReadStat "Unable to allocate memory" at open: the file's
+# embedded strL long-string table is loaded whole before any rows are read,
+# so row/column limits cannot avoid it). Point the affected year at its
+# existing sas7bdat copy; healthy years keep the direct raw-Stata path.
+# Example:
+#   cfg$source_override <- c(
+#     "2019" = "S:/Projects/HMDA/Time_Series/Data/hmda19.sas7bdat")
+cfg$source_override <- c()
+
 # Legacy sas7bdat copies (used only when source_mode == "sas").
 cfg$sas_files <- c(
   "2019" = "hmda19.sas7bdat", "2020" = "hmda20.sas7bdat",
