@@ -27,7 +27,7 @@ cfg$nthreads <- max(1L, parallel::detectCores(logical = TRUE) - 1L)
 
 # ---- Paths (forward slashes are fine on Windows) ---------------------------
 cfg$paths <- list(
-  sas_dir     = "S:/Projects/OCFP_Fair_Lending/2025_New/data/sas",
+  sas_dir     = "S:/Projects/HMDA/Time_Series/Data",
   parquet_dir = "S:/Projects/OCFP_Fair_Lending/2025_New/data/parquet_panel",
   ref_dir     = "S:/Projects/OCFP_Fair_Lending/2025_New/data/reference",
   out_dir     = "S:/Projects/OCFP_Fair_Lending/2025_New/output"
@@ -50,15 +50,19 @@ cfg$ref_files <- list(
 
 # Map each data year to its SAS filename. Adjust to your actual names.
 cfg$sas_files <- c(
-  "2019" = "hmda_2019.sas7bdat",
-  "2020" = "hmda_2020.sas7bdat",
-  "2021" = "hmda_2021.sas7bdat",
-  "2022" = "hmda_2022.sas7bdat",
-  "2023" = "hmda_2023.sas7bdat",
-  "2024" = "hmda_2024.sas7bdat",
-  "2025" = "hmda_2025.sas7bdat"
+  "2019" = "hmda19.sas7bdat", "2020" = "hmda20.sas7bdat",
+  "2021" = "hmda21.sas7bdat", "2022" = "hmda22.sas7bdat",
+  "2023" = "hmda23.sas7bdat", "2024" = "hmda24.sas7bdat",
+  "2025" = "hmda25.sas7bdat"
 )
 cfg$years <- as.integer(names(cfg$sas_files))
+
+# ---- Build-stage settings (from the proven v2 builder) ----------------------
+cfg$build <- list(
+  compression       = "zstd",   # better cold-storage ratio than snappy
+  compression_level = 3L,
+  overwrite         = FALSE     # skip years already converted
+)
 
 # ---- Sentinel / placeholder codes ------------------------------------------
 # VERIFY against the FFIEC Filing Instructions Guide. The SAS program excludes
