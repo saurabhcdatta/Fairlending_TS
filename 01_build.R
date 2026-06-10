@@ -85,12 +85,28 @@ log_error <- function(...) { msg <- paste0(...)
                                  file = .log_file, append = TRUE) } }
 
 # ---- source resolution + format-dispatching reader ---------------------------
-#' Path to a year's source file under the active source mode.
+#' Path to a year's source file: per-year override first, then source mode.
 source_path <- function(year, cfg) {
+  y  <- as.character(year)
+  ov <- cfg$source_override
+  if (!is.null(ov) && y %in% names(ov)) return(ov[[y]])
   if (identical(cfg$source_mode, "stata"))
-    cfg$raw_files[[as.character(year)]]
+    cfg$raw_files[[y]]
   else
-    file.path(cfg$paths$sas_dir, cfg$sas_files[[as.character(year)]])
+    file.path(cfg$paths$sas_dir, cfg$sas_files[[y]])
+}
+
+#' Diagnose whether each year's source can be OPENED at all (1 row, 1 col --
+#' allocation-at-open problems like oversized strL tables fail even this).
+diagnose_sources <- function(cfg) {
+  rbindlist(lapply(cfg$years, function(y) {
+    p <- source_path(y, cfg)
+    r <- tryCatch({ read_source(p, n_max = 1, col_select = "uli"); "ok" },
+                  error = function(e) conditionMessage(e))
+    data.table(year = y, source = basename(p),
+               status = if (identical(r, "ok")) "ok" else "FAIL",
+               detail = if (identical(r, "ok")) "" else r)
+  }))
 }
 
 #' Read one source file; dispatch on extension (.dta Stata / .sas7bdat SAS).
