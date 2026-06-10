@@ -83,7 +83,12 @@ cfg$years <- as.integer(names(cfg$sas_files))
 cfg$build <- list(
   compression       = "zstd",   # better cold-storage ratio than snappy
   compression_level = 3L,
-  overwrite         = FALSE     # skip years already converted
+  overwrite         = FALSE,    # skip years already converted
+  # NULL = read ALL columns (parquet panel is a complete archive of the raw
+  # release -- recommended). To cut the network read/parse cost instead, set
+  # to the modeling columns, e.g.:  unique(c(ANALYSIS_COLS, NUMERIC_FROM_CHAR))
+  # after sourcing 01/02. Tradeoff: the panel then isn't a full archive.
+  col_select        = NULL
 )
 
 # ---- Sentinel / placeholder codes ------------------------------------------
