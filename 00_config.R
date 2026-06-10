@@ -27,7 +27,7 @@ cfg$nthreads <- max(1L, parallel::detectCores(logical = TRUE) - 1L)
 
 # ---- Paths (forward slashes are fine on Windows) ---------------------------
 cfg$paths <- list(
-  sas_dir     = "S:/Projects/HMDA/Time_Series/Data",
+  sas_dir     = "S:/Projects/HMDA/Time_Series/Data",   # legacy sas7bdat copies
   parquet_dir = "S:/Projects/OCFP_Fair_Lending/2025_New/data/parquet_panel",
   ref_dir     = "S:/Projects/OCFP_Fair_Lending/2025_New/data/reference",
   out_dir     = "S:/Projects/OCFP_Fair_Lending/2025_New/output"
@@ -48,7 +48,29 @@ cfg$ref_files <- list(
   jumbo = "jumbo_%d.csv"        # sprintf pattern over data_year
 )
 
-# Map each data year to its SAS filename. Adjust to your actual names.
+# ---- Source data -------------------------------------------------------------
+# "stata": read the RAW per-year Stata files on \\hqwinfs1 directly
+#          (eliminates the SAS import hop AND the duplicate sas7bdat copies).
+# "sas"  : legacy fallback -- the hmda19..25.sas7bdat copies on S:.
+cfg$source_mode <- "stata"
+
+# Raw Stata releases (release-stamped paths; update when a new release lands).
+.agency <- "//hqwinfs1/economist/Projects/HMDA/Agency Data"
+cfg$raw_files <- c(
+  "2019" = file.path(.agency, "2019", "hmda_2019_11_28_2020_final.dta"),
+  "2020" = file.path(.agency, "2020", "all_agency_hmda_2020_06_26_2021_final.dta"),
+  "2021" = file.path(.agency, "2021", "all_agency_hmda_2021_04_28_2022_final.dta"),
+  "2022" = file.path(.agency, "2022", "HMDA_05_31_2023",
+                     "all_agency_hmda_2022_05_31_2023_final.dta"),
+  "2023" = file.path(.agency, "2023", "HMDA_06_30_2024",
+                     "all_agency_hmda_2023_06_30_2024_final.dta"),
+  "2024" = file.path(.agency, "2024", "HMDA_05_31_2025",
+                     "all_agency_hmda_2024_05_31_2025_final.dta"),
+  "2025" = file.path(.agency, "2025", "HMDA_05_31_2026",
+                     "all_agency_hmda_2025_05_31_2026_final.dta")
+)
+
+# Legacy sas7bdat copies (used only when source_mode == "sas").
 cfg$sas_files <- c(
   "2019" = "hmda19.sas7bdat", "2020" = "hmda20.sas7bdat",
   "2021" = "hmda21.sas7bdat", "2022" = "hmda22.sas7bdat",
