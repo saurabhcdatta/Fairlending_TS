@@ -83,7 +83,11 @@ cfg$years <- as.integer(names(cfg$sas_files))
 cfg$build <- list(
   compression       = "zstd",   # better cold-storage ratio than snappy
   compression_level = 3L,
-  overwrite         = FALSE,    # skip years already converted
+  overwrite         = FALSE,    # skip years already converted (.complete marker)
+  # Rows per streamed chunk. all_agency national files (~15M+ rows/year) CANNOT
+  # be read whole on 32GB; chunking caps peak RAM at ~one chunk. Raise on a
+  # bigger machine (e.g. 5e6 at 80GB); NULL = single-shot read (small files only).
+  chunk_rows        = 2e6,
   # NULL = read ALL columns (parquet panel is a complete archive of the raw
   # release -- recommended). To cut the network read/parse cost instead, set
   # to the modeling columns, e.g.:  unique(c(ANALYSIS_COLS, NUMERIC_FROM_CHAR))
