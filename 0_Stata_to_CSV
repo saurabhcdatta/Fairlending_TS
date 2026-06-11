@@ -1,0 +1,113 @@
+/* =========================================================================
+   0_stata_to_csv.sas  --  Stage 0 of the HMDA fair-lending pipeline
+   Raw all_agency Stata releases -> CSV staging for the DuckDB build.
+
+   WHY THIS STAGE EXISTS: haven/ReadStat cannot open the raw .dta files
+   (the embedded strL long-string table is allocated whole at open, so even
+   1-row reads OOM), and compressed sas7bdat copies crash the R session.
+   SAS reads the .dta fine; DuckDB then streams the CSV to typed parquet
+   out-of-core (01_build.R, source_mode = "csv").
+
+   Run ONCE per data release, then never again (per-year skip guard below).
+   LOG CHECK: expect 7 lines "NOTE: [one_year <yr>] rows=<n> -> hmda_<yr>.csv"
+   with row counts ~15M+ each. Any year missing that line did not convert.
+
+   DISK: WORK must hold one full national year (~15M rows) at a time; each
+   year is deleted from WORK before the next begins. Ensure WORK points at
+   a volume with ~100GB free.
+   ========================================================================= */
+
+%let csv_dir=\\hqwinfs1\ECONOMIST\Projects\OCFP_Fair_Lending\Fair_Lending_2026\csv_staging;
+%let sas_dir=S:\Projects\HMDA\Time_Series\Data;   /* used only if keep_sas=YES */
+%let agency=\\hqwinfs1\economist\Projects\HMDA\Agency Data;
+
+libname sasout "&sas_dir";
+
+%macro one_year(year=, dta_file=, keep_sas=NO, force=NO);
+
+  %local csv_out;
+  %let csv_out=&csv_dir\hmda_&year..csv;
+
+  /* ---- skip guard: completed years are not redone on a rerun ---------- */
+  %if %sysfunc(fileexist(&csv_out)) and %upcase(&force)=NO %then %do;
+    %put NOTE: [one_year &year] &csv_out exists -- SKIPPED (force=YES to redo).;
+    %return;
+  %end;
+
+  /* ---- import the raw Stata release into WORK -------------------------- */
+  PROC IMPORT OUT=work.hmda&year
+              DATAFILE="&dta_file"
+              DBMS=STATA REPLACE;
+  RUN;
+
+  %if &syserr > 4 %then %do;
+    %put ERROR: [one_year &year] import failed for &dta_file -- year NOT converted.;
+    %return;
+  %end;
+
+  /* ---- force date formats the DuckDB typing SQL can parse -------------- */
+  /* The build handles ISO, yymmddn8 ('20250103'), and raw SAS epoch
+     day-counts. Stata-imported dates often carry DATE9. ('03JAN2025'),
+     which the build CANNOT parse -- so force yymmddn8 here. A WARNING for
+     a year that lacks app_date is harmless; do not let it create vars. */
+  proc datasets lib=work nolist;
+    modify hmda&year;
+    format action_date app_date yymmddn8.;
+  quit;
+
+  /* ---- row count to the log (the "7 row counts" check) ----------------- */
+  %local nrows;
+  proc sql noprint;
+    select count(*) format=comma15. into :nrows trimmed
+    from work.hmda&year;
+  quit;
+
+  /* ---- export to CSV staging ------------------------------------------- */
+  PROC EXPORT DATA=work.hmda&year
+              OUTFILE="&csv_out"
+              DBMS=CSV REPLACE;
+  RUN;
+
+  %if &syserr > 4 %then
+    %put ERROR: [one_year &year] CSV export failed -- delete any partial &csv_out before rerunning.;
+  %else
+    %put NOTE: [one_year &year] rows=&nrows -> hmda_&year..csv;
+
+  /* ---- optional permanent sas7bdat copy (default NO: no duplicates) ---- */
+  %if %upcase(&keep_sas)=YES %then %do;
+    data sasout.hmda%substr(&year,3,2);
+      set work.hmda&year;
+    run;
+  %end;
+
+  /* ---- free WORK before the next year ----------------------------------- */
+  proc datasets lib=work nolist;
+    delete hmda&year;
+  quit;
+
+%mend one_year;
+
+/* ---- one call per year; paths are the release-stamped files from
+        00_config.R cfg$raw_files. Update when a new release lands. -------- */
+
+%one_year(year=2019, dta_file=&agency\2019\hmda_2019_11_28_2020_final.dta);
+%one_year(year=2020, dta_file=&agency\2020\all_agency_hmda_2020_06_26_2021_final.dta);
+%one_year(year=2021, dta_file=&agency\2021\all_agency_hmda_2021_04_28_2022_final.dta);
+%one_year(year=2022, dta_file=&agency\2022\HMDA_05_31_2023\all_agency_hmda_2022_05_31_2023_final.dta);
+%one_year(year=2023, dta_file=&agency\2023\HMDA_06_30_2024\all_agency_hmda_2023_06_30_2024_final.dta);
+%one_year(year=2024, dta_file=&agency\2024\HMDA_05_31_2025\all_agency_hmda_2024_05_31_2025_final.dta);
+%one_year(year=2025, dta_file=&agency\2025\HMDA_05_31_2026\all_agency_hmda_2025_05_31_2026_final.dta);
+
+/* =========================================================================
+   AFTER THE RUN -- verify before touching R:
+   1. Log shows 7 "NOTE: [one_year <yr>] rows=" lines, each ~15M+.
+   2. csv_staging holds hmda_2019.csv .. hmda_2025.csv with plausible sizes
+      (multi-GB each; a KB-scale file means a silent failure).
+   3. Spot-check one header, e.g. in SAS:
+        data _null_; infile "&csv_dir\hmda_2025.csv" obs=1; input; put _infile_; run;
+      Confirm REGULATORY names (action_type, ln_term, ltv_combined,
+      app_race1, credit_score_app ...). If you see public-style names
+      (loan_term, combined_loan_to_value_ratio ...), STOP -- the R build's
+      schema gate will refuse them, and a rename map must be added to
+      01_build.R first.
+   ========================================================================= */
