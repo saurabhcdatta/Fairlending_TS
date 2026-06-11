@@ -26,11 +26,13 @@ options(arrow.use_threads = TRUE)
 cfg$nthreads <- max(1L, parallel::detectCores(logical = TRUE) - 1L)
 
 # ---- Paths (forward slashes are fine on Windows) ---------------------------
+.proj <- "S:/Projects/OCFP_Fair_Lending/Fair_Lending_2026"   # project root
 cfg$paths <- list(
   sas_dir     = "S:/Projects/HMDA/Time_Series/Data",   # legacy sas7bdat copies
-  parquet_dir = "S:/Projects/OCFP_Fair_Lending/2025_New/data/parquet_panel",
-  ref_dir     = "S:/Projects/OCFP_Fair_Lending/2025_New/data/reference",
-  out_dir     = "S:/Projects/OCFP_Fair_Lending/2025_New/output"
+  parquet_dir = file.path(.proj, "data/parquet_panel"),
+  ref_dir     = file.path(.proj, "reference"),
+  out_dir     = file.path(.proj, "output"),
+  csv_dir     = file.path(.proj, "csv_staging")
 )
 
 # Reference inputs (replacing hardcoded SAS blocks; see README for sources):
@@ -52,7 +54,13 @@ cfg$ref_files <- list(
 # "stata": read the RAW per-year Stata files on \\hqwinfs1 directly
 #          (eliminates the SAS import hop AND the duplicate sas7bdat copies).
 # "sas"  : legacy fallback -- the hmda19..25.sas7bdat copies on S:.
-cfg$source_mode <- "stata"
+# "csv"  : RECOMMENDED -- SAS streams each year to CSV (sas/export_csv_
+#          staging.sas, run once), DuckDB streams CSV -> typed parquet
+#          out-of-core. R never loads raw rows; immune to file size and to
+#          the haven/ReadStat crashes seen on the .dta (strL) and compressed
+#          sas7bdat files.
+cfg$source_mode <- "csv"
+cfg$csv_files   <- "hmda_%d.csv"      # sprintf pattern over data_year
 
 # Raw Stata releases (release-stamped paths; update when a new release lands).
 .agency <- "//hqwinfs1/economist/Projects/HMDA/Agency Data"
@@ -98,6 +106,7 @@ cfg$build <- list(
   # be read whole on 32GB; chunking caps peak RAM at ~one chunk. Raise on a
   # bigger machine (e.g. 5e6 at 80GB); NULL = single-shot read (small files only).
   chunk_rows        = 2e6,
+  duckdb_memory     = "8GB",    # DuckDB spills to disk beyond this; safe cap
   # NULL = read ALL columns (parquet panel is a complete archive of the raw
   # release -- recommended). To cut the network read/parse cost instead, set
   # to the modeling columns, e.g.:  unique(c(ANALYSIS_COLS, NUMERIC_FROM_CHAR))
@@ -185,5 +194,30 @@ cfg$model <- list(
 )
 
 cfg$pclass_compare <- c("black", "hispanic", "asian", "aian", "nhpi")
+
+# ---- Stage 04: Top-N institution screening ----------------------------------
+# Requires reference/cu_assets_<year>.csv per screened year (from
+# 0b_oce_to_assets_csv.sas: lei preferred key, plus name, assets_tot).
+# Two flag tracks are always produced: `anomaly` (SAS-compatible thresholds,
+# Excel workbook letters) and `anomaly_stat` (Welch t + BH-FDR at fdr_q,
+# adverse-direction only), plus EB-shrunk deltas and rank_eb for ordering.
+cfg$screen <- list(
+  top_n              = 200L,
+  min_grps           = 1L,    # minimum # minority groups breaching
+  min_rec            = 100L,  # minimum minority-record count per CU
+  den_min_avg        = 1.1,   # SAS denial threshold on exp(delta)
+  avg_resid          = 10L,   # SAS withdrawal worst-percentile cutoff
+  int_dif            = 0.1,   # SAS pricing rate-delta threshold (pp)
+  ocost_dif          = 0.02,  # SAS pricing other-cost delta threshold
+  min_cell           = 1L,    # min obs per CU x race cell (consider 5-10)
+  deminimis_dollars  = 2,     # SEM $-filter on discount_points/lender_credits
+  sem_extra_filter   = NULL,  # quoted expr if the truncated SAS WHERE had a
+                              # third clause -- VERIFY vs source program (D6)
+  sas_compat         = FALSE, # TRUE only to reconcile vs old SAS output
+  fdr_q              = 0.05,  # statistical track: BH false-discovery rate
+  min_n_model        = 5000L, # refuse to screen on smaller estimation samples
+  review_top_k       = 25L,   # loans per flagged CU x group in review queue
+  years              = NULL   # NULL = all data_year values present
+)
 
 invisible(cfg)
