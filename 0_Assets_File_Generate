@@ -1,0 +1,84 @@
+/* =========================================================================
+   0b_oce_to_assets_csv.sas
+   Produces reference/cu_assets_<year>.csv for 04_screening.R (Top-200 by
+   assets). Replicates Popick_SAS_Code_2 pages 1-2: OCE combined dataset
+   -> year-end quarter -> HMDA xwalk join (join_number <-> lei) -> CSV.
+   The HMDA record-count step from the SAS moved into R (top_assets());
+   only the asset list with lei is needed here.
+
+   Run %assets_year once per HMDA data year. Year-end quarter (yyyy.4)
+   matches the original program's choice of 2025.4 for HMDA 2025.
+   ========================================================================= */
+
+%let ref_dir=\\hqwinfs1\ECONOMIST\Projects\OCFP_Fair_Lending\Fair_Lending_2026\reference;
+%let xwalk_file=\\hqwinfs1\economist\Projects\HMDA\Agency Data\HMDA XWALK\hmda_xwalk_2002-2025.dta; /* <- confirm exact filename */
+
+%macro assets_year(year=, oce_file=, quarter=);
+
+  %if %superq(quarter)= %then %let quarter=&year..4;
+
+  PROC IMPORT OUT=work.oce DATAFILE="&oce_file" DBMS=STATA REPLACE;
+  RUN;
+
+  data work.oce; set work.oce;
+    if q_period_num=&quarter;
+  run;
+
+  PROC IMPORT OUT=work.xwalk DATAFILE="&xwalk_file" DBMS=STATA REPLACE;
+  RUN;
+
+  proc sql;
+    create table work.assets_all as
+    select distinct a.join_number,
+           a.cu_name as name,
+           b.lei,
+           a.assets_tot
+    from work.oce as a left join work.xwalk as b
+      on a.join_number=b.join_number
+    where b.lei is not null
+    order by a.assets_tot desc;
+  quit;
+
+  /* duplicate-lei diagnostic: xwalk fan-out would double-count a CU.
+     Keep the max-asset row per lei; review the log if dups > 0. */
+  proc sql noprint;
+    select count(*) - count(distinct lei) into :n_dup from work.assets_all;
+  quit;
+  %put NOTE: [assets_year &year] duplicate lei rows after xwalk join: &n_dup;
+
+  proc sort data=work.assets_all; by lei descending assets_tot; run;
+  data work.assets_dedup; set work.assets_all; by lei;
+    if first.lei;
+  run;
+
+  proc export data=work.assets_dedup
+    outfile="&ref_dir\cu_assets_&year..csv" dbms=csv replace;
+  run;
+
+  proc sql noprint;
+    select count(*) into :n_out from work.assets_dedup;
+  quit;
+  %put NOTE: [assets_year &year] wrote &n_out CUs to cu_assets_&year..csv;
+
+%mend assets_year;
+
+/* ---- one call per HMDA year; point oce_file at the matching vintage ---- */
+/* 2025 example (path from the original program; confirm full filename):   */
+%assets_year(year=2025,
+  oce_file=S:\Staff\BRUSLAVSKI\2025Q4_make_oce_combined\OCE_combined_2025q4_2000tocurrent.dta);
+
+/* For 2019-2024, the single 2000tocurrent OCE file contains all quarters;
+   reuse it with the year-end quarter filter:                              */
+/*
+%assets_year(year=2024, oce_file=S:\Staff\BRUSLAVSKI\2025Q4_make_oce_combined\OCE_combined_2025q4_2000tocurrent.dta);
+%assets_year(year=2023, oce_file=S:\Staff\BRUSLAVSKI\2025Q4_make_oce_combined\OCE_combined_2025q4_2000tocurrent.dta);
+%assets_year(year=2022, oce_file=S:\Staff\BRUSLAVSKI\2025Q4_make_oce_combined\OCE_combined_2025q4_2000tocurrent.dta);
+%assets_year(year=2021, oce_file=S:\Staff\BRUSLAVSKI\2025Q4_make_oce_combined\OCE_combined_2025q4_2000tocurrent.dta);
+%assets_year(year=2020, oce_file=S:\Staff\BRUSLAVSKI\2025Q4_make_oce_combined\OCE_combined_2025q4_2000tocurrent.dta);
+%assets_year(year=2019, oce_file=S:\Staff\BRUSLAVSKI\2025Q4_make_oce_combined\OCE_combined_2025q4_2000tocurrent.dta);
+*/
+
+/* LOG CHECKS: per year, two NOTEs -- duplicate lei count (expect 0 or
+   near-0; investigate fan-out if large) and CU count written (expect
+   roughly the # of HMDA-reporting CUs, ~1500-2000, NOT 200 -- the Top-N
+   cut happens in R against actual LAR record counts).                     */
