@@ -90,7 +90,9 @@ source_path <- function(year, cfg) {
   y  <- as.character(year)
   ov <- cfg$source_override
   if (!is.null(ov) && y %in% names(ov)) return(ov[[y]])
-  if (identical(cfg$source_mode, "stata"))
+  if (identical(cfg$source_mode, "csv"))
+    file.path(cfg$paths$csv_dir, sprintf(cfg$csv_files, as.integer(year)))
+  else if (identical(cfg$source_mode, "stata"))
     cfg$raw_files[[y]]
   else
     file.path(cfg$paths$sas_dir, cfg$sas_files[[y]])
@@ -209,6 +211,91 @@ harmonize_year <- function(dt, year) {
 }
 
 # ---- atomic per-year conversion (v2 convert_one, hive-partitioned) ----------
+# ============================================================================
+# DuckDB streaming path (source_mode == "csv")  --  the haven-free build
+# ----------------------------------------------------------------------------
+# SAS exports each year to CSV (sas/export_csv_staging.sas; SAS streams, no
+# memory limit). DuckDB then streams CSV -> typed parquet OUT-OF-CORE: R never
+# holds a row of raw data, so file size cannot crash the session. The same
+# typing registries (NUMERIC_FROM_CHAR / KNOWN_NUMERIC / KNOWN_DATE / KEEP_CHAR
+# / residual->varchar) are applied as GENERATED SQL, so the schema contract is
+# identical to the haven path.
+# ============================================================================
+
+.q <- function(x) paste0('"', x, '"')   # quote SQL identifiers
+
+#' Generate the typed SELECT list for one year's CSV columns (lowercased).
+build_typing_sql <- function(cols) {
+  cs_sent <- "(7777, 8888, 9999, 1111)"
+  exprs <- vapply(cols, function(v) {
+    qv <- .q(v)
+    if (v %in% c("credit_score_app", "credit_score_co", "age_app", "age_co")) {
+      sprintf(paste0(
+        "CASE WHEN TRY_CAST(NULLIF(TRIM(%s),'') AS DOUBLE) IN %s THEN NULL ",
+        "ELSE TRY_CAST(NULLIF(TRIM(%s),'') AS DOUBLE) END AS %s"),
+        qv, cs_sent, qv, qv)
+    } else if (v %in% NUMERIC_FROM_CHAR || v %in% KNOWN_NUMERIC) {
+      sprintf("TRY_CAST(NULLIF(REPLACE(REPLACE(TRIM(%s),',',''),'$',''),'') AS DOUBLE) AS %s",
+              qv, qv)
+    } else if (v %in% KNOWN_DATE) {
+      # ISO date | yymmddn8 ('20250103') | SAS epoch day count
+      sprintf(paste0(
+        "COALESCE(TRY_CAST(%s AS DATE), ",
+        "CAST(TRY_STRPTIME(NULLIF(TRIM(%s),''), '%%Y%%m%%d') AS DATE), ",
+        "CASE WHEN TRY_CAST(%s AS BIGINT) BETWEEN -10000 AND 80000 ",
+        "THEN DATE '1960-01-01' + CAST(TRY_CAST(%s AS BIGINT) AS INTEGER) END) AS %s"),
+        qv, qv, qv, qv, qv)
+    } else {
+      sprintf("%s AS %s", qv, qv)   # KEEP_CHAR + residual: varchar at rest
+    }
+  }, character(1))
+  # exemption flags for the char-stored numerics (mirrors flag_exempt())
+  fl <- vapply(intersect(NUMERIC_FROM_CHAR, cols), function(v) {
+    sprintf("(LOWER(TRIM(%s)) = 'exempt' OR TRIM(%s) = '1111') AS %s",
+            .q(v), .q(v), .q(paste0(v, "_exempt")))
+  }, character(1))
+  paste(c(exprs, fl), collapse = ",\n  ")
+}
+
+#' Stream one year's CSV to typed parquet via DuckDB (out-of-core).
+convert_one_year_csv <- function(year, cfg) {
+  t0   <- Sys.time()
+  f    <- source_path(year, cfg)
+  pdir <- file.path(cfg$paths$parquet_dir, paste0("data_year=", year))
+  marker <- file.path(pdir, ".complete")
+  if (file.exists(marker) && !isTRUE(cfg$build$overwrite))
+    return(list(year = year, status = "skipped", rows = NA_integer_,
+                seconds = 0, error = NA_character_))
+  tryCatch({
+    if (dir.exists(pdir)) unlink(pdir, recursive = TRUE)
+    dir.create(pdir, recursive = TRUE, showWarnings = FALSE)
+    con <- DBI::dbConnect(duckdb::duckdb())
+    on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+    DBI::dbExecute(con, sprintf("PRAGMA memory_limit='%s'", cfg$build$duckdb_memory))
+    DBI::dbExecute(con, sprintf("PRAGMA temp_directory='%s'",
+      gsub("'", "''", file.path(cfg$paths$parquet_dir, ".duckdb_tmp"))))
+    csv_src <- sprintf(
+      "read_csv('%s', header=true, all_varchar=true, sample_size=-1, normalize_names=true)",
+      gsub("'", "''", f))
+    cols <- tolower(names(DBI::dbGetQuery(con,
+      sprintf("SELECT * FROM %s LIMIT 0", csv_src))))
+    sel  <- build_typing_sql(cols)
+    out  <- file.path(pdir, "part-0.parquet"); tmp <- paste0(out, ".tmp")
+    n <- DBI::dbExecute(con, sprintf(
+      "COPY (SELECT\n  %s,\n  %d AS data_year\nFROM %s) TO '%s' (FORMAT PARQUET, COMPRESSION zstd)",
+      sel, as.integer(year), csv_src, gsub("'", "''", tmp)))
+    file.rename(tmp, out)
+    writeLines(as.character(n), marker)
+    list(year = year, status = "ok", rows = n,
+         seconds = as.numeric(difftime(Sys.time(), t0, units = "secs")),
+         error = NA_character_)
+  }, error = function(e) {
+    list(year = year, status = "error", rows = NA_integer_,
+         seconds = as.numeric(difftime(Sys.time(), t0, units = "secs")),
+         error = conditionMessage(e))
+  })
+}
+
 # ---- chunked per-year conversion (streams national-scale files) -------------
 # all_agency files run ~15M+ rows/year; a single read_dta() of a full year is
 # 20-40GB in R and OOMs a 32GB machine. We therefore stream in chunks of
@@ -284,7 +371,8 @@ build_panel <- function(cfg, overwrite = NULL) {
 
   # Schema-presence drift report (header-only reads; fast)
   col_map <- rbindlist(lapply(seq_along(cfg$years), function(i) {
-    hdr <- read_source(paths[i], n_max = 0)
+    hdr <- if (identical(cfg$source_mode, "csv"))
+      fread(paths[i], nrows = 0) else read_source(paths[i], n_max = 0)
     data.table(year = as.character(cfg$years[i]), col = tolower(names(hdr)))
   }))
   presence <- dcast(col_map[, .(year, col, present = TRUE)],
@@ -296,7 +384,9 @@ build_panel <- function(cfg, overwrite = NULL) {
              paste(drift, collapse = ", "))
 
   start <- Sys.time()
-  results <- lapply(cfg$years, convert_one_year, cfg = cfg)
+  converter <- if (identical(cfg$source_mode, "csv"))
+    convert_one_year_csv else convert_one_year
+  results <- lapply(cfg$years, converter, cfg = cfg)
   res <- rbindlist(lapply(results, as.data.table))
 
   for (i in seq_len(nrow(res))) {
