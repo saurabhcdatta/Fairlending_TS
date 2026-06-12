@@ -29,20 +29,48 @@
 suppressPackageStartupMessages(library(data.table))
 
 # ---- download helper ---------------------------------------------------------
+# Method cascade: libcurl first (direct), then wininet on Windows (inherits
+# the Windows/IE PROXY configuration -- on managed networks where only .gov
+# is reachable directly, this is usually the one that works), then the curl
+# package if installed. Every failed attempt's reason is collected and
+# reported, so a proxy block is distinguishable from a 404 or a timeout.
+.dl_methods <- function() {
+  m <- "libcurl"
+  if (.Platform$OS.type == "windows") m <- c(m, "wininet")
+  if (requireNamespace("curl", quietly = TRUE)) m <- c(m, "curl-pkg")
+  unique(c(getOption("download.file.method", character()), m))
+}
+
 .dl <- function(urls, dest, binary = TRUE) {
-  old <- getOption("timeout"); options(timeout = max(600, old)); on.exit(options(timeout = old))
-  for (u in urls) {
-    ok <- tryCatch({
-      utils::download.file(u, dest, mode = if (binary) "wb" else "w",
-                           quiet = TRUE,
-                           method = getOption("download.file.method", "libcurl"))
-      file.exists(dest) && file.size(dest) > 1000   # tiny file = error page
-    }, error = function(e) FALSE, warning = function(w) FALSE)
-    if (isTRUE(ok)) return(u)
+  old <- getOption("timeout"); options(timeout = max(600, old))
+  on.exit(options(timeout = old))
+  log <- character()
+  for (u in urls) for (meth in .dl_methods()) {
+    res <- tryCatch({
+      if (meth == "curl-pkg")
+        curl::curl_download(u, dest, quiet = TRUE,
+                            mode = if (binary) "wb" else "w")
+      else
+        suppressWarnings(utils::download.file(
+          u, dest, mode = if (binary) "wb" else "w",
+          quiet = TRUE, method = meth))
+      if (file.exists(dest) && file.size(dest) > 1000) "OK"
+      else "response too small (error page?)"
+    }, error = function(e) conditionMessage(e))
+    if (identical(res, "OK")) {
+      if (meth != .dl_methods()[1])
+        message("    [download] succeeded via method \"", meth, "\" -- ",
+                "consider options(download.file.method = \"", 
+                sub("curl-pkg", "libcurl", meth), "\") for this session")
+      return(u)
+    }
     unlink(dest)
+    log <- c(log, sprintf("[%s] %s -> %s", meth, u, res))
   }
-  stop("All candidate URLs failed:\n  ", paste(urls, collapse = "\n  "),
-       call. = FALSE)
+  stop("All download attempts failed:\n  ", paste(log, collapse = "\n  "),
+       "\nIf the browser CAN open these URLs, the corporate proxy is the",
+       " cause;\nif the browser CANNOT, the host is network-blocked --",
+       " stage the file manually.", call. = FALSE)
 }
 
 # ---- 1. PMMS weekly (FRED MORTGAGE30US) ---------------------------------------
