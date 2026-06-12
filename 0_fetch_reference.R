@@ -28,6 +28,9 @@
 
 suppressPackageStartupMessages(library(data.table))
 
+# null-coalesce (base R >= 4.4 ships this; define for standalone sourcing)
+if (!exists("%||%")) `%||%` <- function(a, b) if (is.null(a)) b else a
+
 # ---- download helper ---------------------------------------------------------
 # Method cascade: libcurl first (direct), then wininet on Windows (inherits
 # the Windows/IE PROXY configuration -- on managed networks where only .gov
@@ -73,25 +76,137 @@ suppressPackageStartupMessages(library(data.table))
        " stage the file manually.", call. = FALSE)
 }
 
-# ---- 1. PMMS weekly (FRED MORTGAGE30US) ---------------------------------------
-fetch_pmms <- function(cfg, overwrite = FALSE) {
-  dest <- file.path(cfg$paths$ref_dir, "pmms_weekly.csv")
-  if (file.exists(dest) && !overwrite) return("skipped (exists)")
-  tmp <- tempfile(fileext = ".csv")
-  url <- .dl("https://fred.stlouisfed.org/graph/fredgraph.csv?id=MORTGAGE30US",
-             tmp, binary = FALSE)
-  x <- fread(tmp)
-  # fredgraph.csv: col 1 = DATE / observation_date, col 2 = MORTGAGE30US;
-  # missing weeks arrive as "." -> NA after coercion, dropped.
-  setnames(x, c("date", "pmms"))
-  x[, date := as.IDate(date)]
-  x[, pmms := suppressWarnings(as.numeric(pmms))]
+# ---- 1. PMMS weekly: FRED primary, Freddie Mac archive fallback ---------------
+pmms_validate_write <- function(x, cfg, dest, src_label) {
   x <- x[!is.na(date) & !is.na(pmms)]
   stopifnot("PMMS values implausible"   = x[, all(pmms > 1 & pmms < 20)],
             "PMMS coverage short"       = x[, max(year(date))] >= max(cfg$years),
             "PMMS starts too late"      = x[, min(year(date))] <= min(cfg$years))
-  fwrite(x, dest)
-  sprintf("ok (%d weeks, %s..%s) <- %s", nrow(x), min(x$date), max(x$date), url)
+  setorder(x, date)
+  fwrite(x[, .(date, pmms)], dest)
+  sprintf("ok (%d weeks, %s..%s) <- %s", nrow(x), min(x$date), max(x$date),
+          src_label)
+}
+
+# FRED API (api.stlouisfed.org -- a DIFFERENT host from the often-blocked
+# fred.stlouisfed.org; the user's macro-indicator script already uses it).
+# Key resolution: cfg$fred_api_key, else FRED_API_KEY env var (.Renviron).
+.fred_api_key <- function(cfg)
+  cfg$fred_api_key %||% Sys.getenv("FRED_API_KEY", unset = NA)
+
+.mask_key <- function(s, key)
+  if (is.na(key) || !nzchar(key)) s else gsub(key, "***", s, fixed = TRUE)
+
+pmms_from_fred_api <- function(path) {
+  if (!requireNamespace("jsonlite", quietly = TRUE))
+    stop("FRED API parsing needs the jsonlite package.", call. = FALSE)
+  j <- jsonlite::fromJSON(path)
+  if (is.null(j$observations))
+    stop("FRED API response had no observations (bad key?).", call. = FALSE)
+  x <- as.data.table(j$observations)[, .(date, value)]
+  setnames(x, c("date", "pmms"))
+  x[, date := as.IDate(date)]
+  x[, pmms := suppressWarnings(as.numeric(pmms))]   # "." missings -> NA
+  x[]
+}
+
+pmms_from_fred <- function(path) {
+  x <- fread(path)                       # DATE/observation_date, MORTGAGE30US
+  setnames(x, c("date", "pmms"))
+  x[, date := as.IDate(date)]
+  x[, pmms := suppressWarnings(as.numeric(pmms))]
+  x[]
+}
+
+# Freddie Mac historicalweeklydata.xlsx: title rows precede a header row whose
+# first cell is the week/date column; the 30yr FRM rate is the first column
+# whose header mentions "30". Footnote rows fall out as NA dates.
+pmms_from_freddie <- function(path) {
+  rdr <- if (requireNamespace("readxl", quietly = TRUE))
+    function(skip) readxl::read_excel(path, skip = skip, col_types = "text")
+  else if (requireNamespace("openxlsx2", quietly = TRUE))
+    function(skip) openxlsx2::read_xlsx(path, start_row = skip + 1L,
+                                        col_types = "character")
+  else stop("Reading the Freddie Mac PMMS .xlsx needs readxl or openxlsx2.",
+            call. = FALSE)
+  probe <- as.data.frame(rdr(0L))
+  sig   <- apply(head(probe, 12L), 1L, function(r)
+    paste(as.character(r), collapse = ""))
+  norm  <- tolower(gsub("[^A-Za-z0-9]", "", c(paste(names(probe), collapse=""), sig)))
+  hit   <- which(grepl("week|date", norm))[1]
+  if (is.na(hit)) stop("Freddie PMMS layout not recognized.", call. = FALSE)
+  d <- as.data.frame(if (hit == 1L) probe else rdr(hit - 1L))
+  cn <- tolower(gsub("[^A-Za-z0-9]", "", names(d)))
+  rate_col <- which(grepl("30", cn))[1]
+  if (is.na(rate_col) || rate_col == 1L)
+    stop("Freddie PMMS layout not recognized (no 30yr column).", call. = FALSE)
+  out <- data.table(date_raw = as.character(d[[1]]),
+                    pmms = suppressWarnings(as.numeric(d[[rate_col]])))
+  out[, date := .parse_pmms_dates(date_raw)]
+  out[, .(date, pmms)]
+}
+
+# dates arrive as ISO text, US text, or Excel serial numbers depending on
+# the reader; parse all three, element-wise, NA on failure.
+.parse_pmms_dates <- function(v) {
+  v <- as.character(v)
+  out <- rep(as.Date(NA), length(v))
+  ser <- grepl("^[0-9]{4,6}$", v) & !is.na(v)
+  out[ser] <- as.Date(suppressWarnings(as.numeric(v[ser])),
+                      origin = "1899-12-30")
+  for (fmt in c("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y")) {
+    need <- is.na(out) & !is.na(v) & !ser
+    if (!any(need)) break
+    cand <- as.Date(v[need], format = fmt)
+    # %Y greedily accepts 2-digit years as year 24 AD; reject implausible
+    cand[!is.na(cand) & as.integer(format(cand, "%Y")) < 1950] <- NA
+    out[need] <- cand
+  }
+  as.IDate(out)
+}
+
+fetch_pmms <- function(cfg, overwrite = FALSE) {
+  dest <- file.path(cfg$paths$ref_dir, "pmms_weekly.csv")
+  if (file.exists(dest) && !overwrite) return("skipped (exists)")
+  key  <- .fred_api_key(cfg)
+  errs <- character()
+
+  # 1. FRED API (api.stlouisfed.org) -- first whenever a key is available
+  if (!is.na(key) && nzchar(key)) {
+    r <- tryCatch({
+      tmp <- tempfile(fileext = ".json")
+      u <- sprintf(paste0("https://api.stlouisfed.org/fred/series/observations",
+                          "?series_id=MORTGAGE30US&file_type=json&api_key=%s"),
+                   key)
+      .dl(u, tmp, binary = FALSE)
+      return(pmms_validate_write(pmms_from_fred_api(tmp), cfg, dest,
+                                 "FRED API (api.stlouisfed.org)"))
+    }, error = function(e) .mask_key(conditionMessage(e), key))
+    errs <- c(errs, paste("FRED API:", r))
+  } else {
+    errs <- c(errs, paste("FRED API: no key (set cfg$fred_api_key or",
+                          "FRED_API_KEY in .Renviron)"))
+  }
+
+  # 2. fredgraph.csv (fred.stlouisfed.org)
+  r <- tryCatch({
+    tmp <- tempfile(fileext = ".csv")
+    url <- .dl("https://fred.stlouisfed.org/graph/fredgraph.csv?id=MORTGAGE30US",
+               tmp, binary = FALSE)
+    return(pmms_validate_write(pmms_from_fred(tmp), cfg, dest, url))
+  }, error = function(e) conditionMessage(e))
+  errs <- c(errs, paste("fredgraph:", r))
+
+  # 3. Freddie Mac archive
+  r <- tryCatch({
+    tmp <- tempfile(fileext = ".xlsx")
+    url <- .dl("https://www.freddiemac.com/pmms/docs/historicalweeklydata.xlsx",
+               tmp)
+    return(pmms_validate_write(pmms_from_freddie(tmp), cfg, dest, url))
+  }, error = function(e) conditionMessage(e))
+  errs <- c(errs, paste("Freddie:", r))
+
+  stop(paste(errs, collapse = "\n"), call. = FALSE)
 }
 
 # ---- 2. MSA crosswalk (NBER cbsa2fipsxw) --------------------------------------
@@ -102,23 +217,80 @@ fetch_pmms <- function(cfg, overwrite = FALSE) {
 # This affects CT only and only the geography FE granularity; if CT matters
 # for a given analysis, supply a legacy-vintage crosswalk manually and the
 # skip-if-exists guard will leave it untouched.
-fetch_msa_xwalk <- function(cfg, overwrite = FALSE) {
-  dest <- file.path(cfg$paths$ref_dir, "msa_crosswalk.csv")
-  if (file.exists(dest) && !overwrite) return("skipped (exists)")
-  tmp <- tempfile(fileext = ".csv")
-  url <- .dl("https://data.nber.org/cbsa-csa-fips-county-crosswalk/cbsa2fipsxw.csv",
-             tmp, binary = FALSE)
-  x <- fread(tmp)
-  setnames(x, tolower(gsub("[^A-Za-z0-9]", "", names(x))))
+.xwalk_validate_write <- function(x, dest, src_label) {
   need <- c("fipsstatecode", "fipscountycode", "cbsacode",
             "metropolitanmicropolitanstatis")
   miss <- setdiff(need, names(x))
   if (length(miss))
-    stop("NBER crosswalk schema changed; missing: ", paste(miss, collapse = ", "),
+    stop("crosswalk schema unexpected; missing: ", paste(miss, collapse = ", "),
          call. = FALSE)
-  stopifnot("crosswalk implausibly small" = nrow(x) > 1500)
+  x <- x[!is.na(fipsstatecode) & !is.na(fipscountycode)]
+  stopifnot("crosswalk implausibly small" = nrow(x) > 1000)
   fwrite(x, dest)
-  sprintf("ok (%d county rows) <- %s", nrow(x), url)
+  sprintf("ok (%d county rows) <- %s", nrow(x), src_label)
+}
+
+xwalk_from_nber <- function(path) {
+  x <- fread(path)
+  setnames(x, tolower(gsub("[^A-Za-z0-9]", "", names(x))))
+  x[]
+}
+
+# Census delineation file (list1): the .gov source the NBER file derives
+# from. Title rows precede the header; footnote rows trail the data (dropped
+# via NA fips). The March-2020 vintage (list1_2020.xls) carries LEGACY
+# Connecticut counties, matching HMDA 2019-2024 -- preferable to the current
+# NBER file for this panel.
+xwalk_from_census <- function(path) {
+  is_xls <- grepl("\\.xls$", path, ignore.case = TRUE)
+  rdr <- if (requireNamespace("readxl", quietly = TRUE))
+    function(skip) readxl::read_excel(path, skip = skip)
+  else if (!is_xls && requireNamespace("openxlsx2", quietly = TRUE))
+    function(skip) openxlsx2::read_xlsx(path, start_row = skip + 1L)
+  else stop("Reading the Census delineation file needs readxl",
+            if (is_xls) " (.xls requires readxl specifically)", ".",
+            call. = FALSE)
+  probe <- as.data.frame(rdr(0L))
+  if (!any(tolower(gsub("[^A-Za-z0-9]", "", names(probe))) == "fipsstatecode")) {
+    sig <- apply(head(probe, 10L), 1L, function(r)
+      paste(as.character(r), collapse = ""))
+    probe <- as.data.frame(rdr(.find_header_line(sig)))
+  }
+  x <- as.data.table(probe)
+  setnames(x, tolower(gsub("[^A-Za-z0-9]", "", names(x))))
+  # Census full name vs NBER Stata-truncated name expected by 02_derive
+  long <- grep("^metropolitanmicropolitanstatis", names(x), value = TRUE)[1]
+  if (!is.na(long) && long != "metropolitanmicropolitanstatis")
+    setnames(x, long, "metropolitanmicropolitanstatis")
+  for (cn in c("fipsstatecode", "fipscountycode", "cbsacode"))
+    if (cn %in% names(x))
+      x[, (cn) := suppressWarnings(as.numeric(get(cn)))]
+  x[]
+}
+
+fetch_msa_xwalk <- function(cfg, overwrite = FALSE) {
+  dest <- file.path(cfg$paths$ref_dir, "msa_crosswalk.csv")
+  if (file.exists(dest) && !overwrite) return("skipped (exists)")
+  errs <- character()
+  # 1. NBER (canonical names, no Excel dependency)
+  r <- tryCatch({
+    tmp <- tempfile(fileext = ".csv")
+    url <- .dl("https://data.nber.org/cbsa-csa-fips-county-crosswalk/cbsa2fipsxw.csv",
+               tmp, binary = FALSE)
+    return(.xwalk_validate_write(xwalk_from_nber(tmp), dest, url))
+  }, error = function(e) conditionMessage(e))
+  errs <- c(errs, paste("NBER:", r))
+  # 2. Census .gov delineation files (2020 vintage first: legacy CT counties)
+  for (u in c("https://www2.census.gov/programs-surveys/metro-micro/geographies/reference-files/2020/delineation-files/list1_2020.xls",
+              "https://www2.census.gov/programs-surveys/metro-micro/geographies/reference-files/2023/delineation-files/list1_2023.xlsx")) {
+    r <- tryCatch({
+      tmp <- tempfile(fileext = paste0(".", tools::file_ext(u)))
+      url <- .dl(u, tmp)
+      return(.xwalk_validate_write(xwalk_from_census(tmp), dest, url))
+    }, error = function(e) conditionMessage(e))
+    errs <- c(errs, paste("Census:", r))
+  }
+  stop(paste(errs, collapse = "\n"), call. = FALSE)
 }
 
 # ---- 3. FHFA conforming loan limits per year ----------------------------------
@@ -206,6 +378,72 @@ fetch_jumbo_year <- function(cfg, year, overwrite = FALSE) {
   sprintf("ok (%d counties, 1-unit %s..%s) <- %s", nrow(x),
           format(min(x$One_Unit_Limit), big.mark = ","),
           format(max(x$One_Unit_Limit), big.mark = ","), url)
+}
+
+# ---- manual staging: convert browser-downloaded files -------------------------
+#' Guaranteed fallback when R cannot reach a host but the browser can:
+#' download the raw files in Edge into one folder (e.g. Downloads), then
+#'   stage_manual_reference(cfg, "C:/Users/<you>/Downloads")
+#' Recognized raw files (any of):
+#'   PMMS:   MORTGAGE30US*.csv / fredgraph*.csv / historicalweeklydata*.xlsx
+#'   xwalk:  cbsa2fipsxw*.csv / list1*.xls / list1*.xlsx
+#'   jumbo:  *ountyloanlimitlist<YEAR>*.csv / .xlsx  (year read from name)
+#' Each is parsed, validated, and written to cfg$paths$ref_dir with the
+#' exact schema the pipeline expects. Existing reference files are kept
+#' unless overwrite = TRUE.
+stage_manual_reference <- function(cfg, src_dir, overwrite = FALSE) {
+  stopifnot(dir.exists(src_dir))
+  dir.create(cfg$paths$ref_dir, recursive = TRUE, showWarnings = FALSE)
+  fs <- list.files(src_dir, full.names = TRUE)
+  st <- data.table(item = character(), status = character())
+  add <- function(i, s) st <<- rbind(st, data.table(item = i, status = s))
+  grab <- function(pat) { h <- fs[grepl(pat, basename(fs), ignore.case = TRUE)]
+                          if (length(h)) h[which.max(file.mtime(h))] else NA }
+
+  # PMMS
+  dest <- file.path(cfg$paths$ref_dir, "pmms_weekly.csv")
+  if (file.exists(dest) && !overwrite) add("pmms_weekly", "skipped (exists)")
+  else {
+    f_csv <- grab("^(MORTGAGE30US|fredgraph).*\\.csv$")
+    f_xl  <- grab("^historicalweeklydata.*\\.xlsx$")
+    add("pmms_weekly", tryCatch(
+      if (!is.na(f_csv)) pmms_validate_write(pmms_from_fred(f_csv), cfg, dest, basename(f_csv))
+      else if (!is.na(f_xl)) pmms_validate_write(pmms_from_freddie(f_xl), cfg, dest, basename(f_xl))
+      else "no raw file found (MORTGAGE30US*.csv / historicalweeklydata*.xlsx)",
+      error = function(e) paste("FAILED:", conditionMessage(e))))
+  }
+
+  # crosswalk
+  dest <- file.path(cfg$paths$ref_dir, "msa_crosswalk.csv")
+  if (file.exists(dest) && !overwrite) add("msa_crosswalk", "skipped (exists)")
+  else {
+    f_csv <- grab("^cbsa2fipsxw.*\\.csv$")
+    f_xl  <- grab("^list1.*\\.(xls|xlsx)$")
+    add("msa_crosswalk", tryCatch(
+      if (!is.na(f_csv)) .xwalk_validate_write(xwalk_from_nber(f_csv), dest, basename(f_csv))
+      else if (!is.na(f_xl)) .xwalk_validate_write(xwalk_from_census(f_xl), dest, basename(f_xl))
+      else "no raw file found (cbsa2fipsxw*.csv / list1*.xls[x])",
+      error = function(e) paste("FAILED:", conditionMessage(e))))
+  }
+
+  # jumbo, year parsed from filename
+  jb <- fs[grepl("ountyloanlimitlist[0-9]{4}.*\\.(csv|xlsx)$", basename(fs),
+                 ignore.case = TRUE)]
+  for (f in jb) {
+    y    <- as.integer(regmatches(basename(f),
+              regexpr("[0-9]{4}", basename(f))))
+    dest <- file.path(cfg$paths$ref_dir, sprintf("jumbo_%d.csv", y))
+    if (file.exists(dest) && !overwrite) { add(sprintf("jumbo_%d", y), "skipped (exists)"); next }
+    add(sprintf("jumbo_%d", y), tryCatch({
+      x <- normalize_fhfa(.read_fhfa(f))
+      stopifnot(nrow(x) > 3000,
+                x[, all(One_Unit_Limit >= 3e5 & One_Unit_Limit <= 3e6)])
+      fwrite(x, dest)
+      sprintf("ok (%d counties) <- %s", nrow(x), basename(f))
+    }, error = function(e) paste("FAILED:", conditionMessage(e))))
+  }
+  print(st)
+  invisible(st)
 }
 
 # ---- driver --------------------------------------------------------------------
