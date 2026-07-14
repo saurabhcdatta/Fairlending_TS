@@ -229,7 +229,8 @@ keep_fields <- intersect(
     "interest_rate", "rate_spread", "disc_points", "lender_credits",
     "loan_costs", "aus", "broker", "early_bankrupt", "action_type",
     "action_date", "fips", "property_state",
-    "denial_reason1", "denial_reason2", "denial_reason3"), names(dat))
+    "denial_reason1", "denial_reason2", "denial_reason3",
+    "cs_bin", "dti_bin", "ltv_bin", "income_bin"), names(dat))
 loans <- merge(outliers, dat[, ..keep_fields], by = "uli", all.x = TRUE)
 
 # WHY, per loan, in plain columns:
@@ -255,12 +256,153 @@ loans[screen == "pricing",
          "9" = "other", "10" = "not applicable")
 if ("denial_reason1" %in% names(loans))
   loans[, cu_stated_reason := unname(.dr[as.character(denial_reason1)])]
+# ---- WHY-ENGINE: which factors made this outcome an outlier -------------------
+# For the Popick stream the logit is transparent: each factor's coefficient
+# IS its contribution. For every outlier loan we look up the coefficients of
+# the loan's own characteristics in that screen's model and report:
+#   outlier_reason        the top factors that pointed toward the GOOD
+#                         outcome (approval / retention / cheaper rate) --
+#                         i.e., what made the actual outcome surprising
+#   risk_factors_present  any characteristics that pointed the other way,
+#                         so the reviewer sees both sides
+# (ML-stream equivalent: shap_outliers_2025.csv from 03b.)
+cf_file <- out("model_coefficients_2025.csv")
+if (file.exists(cf_file)) {
+  cf <- fread(cf_file)
+  # fixest names plain-factor terms as <var><level>, e.g. "cs_bin[740, Inf)";
+  # numeric dummies (aus, broker, early_bankrupt) are just the bare name --
+  # their coefficient applies at level "1".
+  expl_vars <- c("cs_bin", "dti_bin", "ltv_bin", "income_bin",
+                 "aus", "broker", "early_bankrupt")
+  cf[, var := ""]
+  for (v in expl_vars[order(-nchar(expl_vars))])
+    cf[var == "" & startsWith(term, v),
+       `:=`(var = v, level = substring(term, nchar(v) + 1L))]
+  cf <- cf[var != ""]
+  cf[level == "", level := "1"]
+  # model key per screen: denial/withdrawn logits; pricing = rate model
+  loans[, mkey := fifelse(screen == "denial",
+                    sprintf("denied | %s", loan_cat),
+                  fifelse(screen == "withdrawal",
+                    sprintf("withdrawn | %s", loan_cat),
+                  fifelse(screen == "pricing",
+                    sprintf("pricing interest_rate | %s", loan_cat),
+                    NA_character_)))]
+  have <- intersect(expl_vars, names(loans))
+  lv <- melt(loans[, c("uli", "mkey", have), with = FALSE],
+             id.vars = c("uli", "mkey"), variable.name = "var",
+             value.name = "level", variable.factor = FALSE)
+  lv[, level := as.character(level)]
+  lv <- merge(lv, cf[, .(model, var, level, estimate)],
+              by.x = c("mkey", "var", "level"),
+              by.y = c("model", "var", "level"))
+  lv[, lbl := sprintf("%s=%s (%+.2f)", var, level, estimate)]
+  # ---- plain-language rendering for non-technical readers ----------------
+  .rng <- function(x) {           # "(80,90]" -> "between 80 and 90", etc.
+    x <- trimws(x)
+    first <- substr(x, 1, 1); last <- substr(x, nchar(x), nchar(x))
+    if (!(first %in% c("(", "[")) || !(last %in% c(")", "]"))) return(x)
+    parts <- trimws(strsplit(substr(x, 2, nchar(x) - 1), ",",
+                             fixed = TRUE)[[1]])
+    if (length(parts) != 2) return(x)
+    lo <- parts[1]; hi <- parts[2]
+    if (lo %in% c("-Inf", "-inf")) paste(hi, "or below")
+    else if (hi %in% c("Inf", "inf")) paste(lo, "or above")
+    else paste("between", lo, "and", hi)
+  }
+  .noun <- c(cs_bin = "credit score %s",
+             dti_bin = "debt-to-income ratio %s%%",
+             ltv_bin = "loan-to-value %s%%",
+             income_bin = "income in the %s band",
+             aus = "application went through automated underwriting",
+             broker = "application came through a broker",
+             early_bankrupt = "recent credit-risk markers on file")
+  lv[, plain := vapply(seq_len(.N), function(i) {
+        v <- var[i]
+        if (v %in% c("aus", "broker", "early_bankrupt")) .noun[[v]]
+        else sprintf(.noun[[v]], .rng(level[i]))
+      }, character(1))]
+  lv[, weight := fifelse(abs(estimate) >= 0.8, "major factor",
+                 fifelse(abs(estimate) >= 0.3, "moderate factor",
+                                               "supporting factor"))]
+  lv[, plain_w := sprintf("%s (%s)", plain, weight)]
+  good <- lv[estimate < 0][order(estimate),
+             .(outlier_reason = paste(head(lbl, 3), collapse = "; "),
+               reason_plain   = paste(head(plain_w, 3), collapse = "; ")),
+             by = uli]
+  bad  <- lv[estimate > 0.05][order(-estimate),
+             .(risk_factors_present = paste(head(lbl, 2), collapse = "; "),
+               risk_plain = paste(head(plain_w, 2), collapse = "; ")),
+             by = uli]
+  loans <- merge(loans, good, by = "uli", all.x = TRUE)
+  loans <- merge(loans, bad,  by = "uli", all.x = TRUE)
+  for (cc in c("outlier_reason", "reason_plain", "risk_factors_present",
+               "risk_plain"))
+    if (cc %in% names(loans)) loans[is.na(get(cc)), (cc) := ""]
+  # lead-in by screen so the sentence reads on its own
+  .lead <- c(denial = "Approval was expected mainly because of: ",
+             withdrawal = "Completion was expected mainly because of: ",
+             pricing = "A lower rate was expected mainly because of: ")
+  loans[nzchar(reason_plain),
+        reason_plain := paste0(.lead[screen], reason_plain)]
+  loans[nzchar(risk_plain),
+        risk_plain := paste0("Working the other way: ", risk_plain)]
+  loans[, mkey := NULL]
+  cat("Per-loan reasons attached from model coefficients",
+      "(top approval-pointing factors + any risk factors).
+")
+} else cat("(model_coefficients_2025.csv not found -- rerun 03a for",
+           "per-loan reasons)
+")
 loans <- merge(loans, assets[, .(lei, name)], by = "lei", all.x = TRUE)
 setorder(loans, screen, -resid)
 setcolorder(loans, c("name", "lei", "screen", "loan_cat", "group", "uli",
                      "resid"))
 fwrite(loans, out("outlier_loans_2025.csv"))
 fwrite(loans, out(sprintf("outlier_loans_%s_2025.csv", stream_tag)))
+# ---- separate worksheets per screen: ALWAYS all three core screens ------------
+# (an empty sheet with headers means "no outliers on this screen" -- a
+#  missing sheet would be ambiguous)
+sheet_screens <- union(c("denial", "withdrawal", "pricing"),
+                       unique(loans$screen))
+for (sc in sheet_screens)
+  fwrite(loans[screen == sc],
+         out(sprintf("outlier_loans_%s_sheet_2025.csv", sc)))
+if (requireNamespace("writexl", quietly = TRUE)) {
+  readme <- data.table(
+    column = c("name", "screen", "group", "uli", "resid", "model_expected",
+               "model_expected_rate", "excess_other_costs_pct",
+               "reason_plain", "risk_plain", "cu_stated_reason",
+               "credit_score", "dti", "ltv_combined", "outlier_reason",
+               "risk_factors_present", "stream"),
+    what_it_means = c(
+      "Credit union name",
+      "Which review: denial, withdrawal, pricing, or steering",
+      "Borrower group compared against white borrowers at the same CU",
+      "The loan identifier (HMDA universal loan ID)",
+      "How surprising the outcome was (bigger = more unexpected)",
+      "The chance the model gave this adverse outcome (e.g. 0.05 = 5%); small numbers mean the outcome was very unexpected",
+      "Pricing rows: the interest rate the model expected for this loan",
+      "Pricing rows: extra fees beyond expectation (points - credits + costs, % of loan)",
+      "PLAIN-LANGUAGE: why the model expected a good outcome for this borrower",
+      "PLAIN-LANGUAGE: anything in the profile that pointed the other way",
+      "The institution's own reported denial reason from its HMDA filing",
+      "Borrower credit score used in underwriting",
+      "Debt-to-income ratio (%)",
+      "Combined loan-to-value (%)",
+      "Technical version of reason_plain (model log-odds contributions)",
+      "Technical version of risk_plain",
+      "Which analysis stream produced this row (popick / ml)"))
+  sheets <- c(list(readme),
+              lapply(sheet_screens, function(sc) loans[screen == sc]))
+  names(sheets) <- tools::toTitleCase(c("ReadMe", sheet_screens))
+  writexl::write_xlsx(sheets, out("outlier_loans_2025.xlsx"))
+  cat("Workbook with one worksheet per screen ->",
+      out("outlier_loans_2025.xlsx"), "
+")
+} else cat("(writexl not installed -- per-screen CSVs written instead;",
+           "install.packages('writexl') for a single workbook)
+")
 cat(sprintf("\nStage-2 file: %s outlier loans with underwriting fields -> %s\n",
             format(nrow(loans), big.mark = ","), out("outlier_loans_2025.csv")))
 cat("Per-screen breakdown of exported loan IDs:\n")
