@@ -23,12 +23,23 @@ library(data.table)
 source("settings.R")
 
 # ------------------------------- FILTERS (edit here) --------------------------
-flag_source       <- c("v2", "sas")  # which flags define the cells to mine:
-                                     # "v2" tiers high/flag, "sas" legacy
-                                     # anomalies, or both (union)
-denial_loan_cut   <- 0.5   # denied with predicted denial prob < 0.5
-withdrawn_loan_cut <- 0.5  # withdrawn with predicted withdrawal prob < 0.5
-pricing_loan_cut  <- 0.25  # rate residual >= 0.25pp above prediction
+flag_source       <- c("v2", "sas")  # "v2" tiers, "sas" legacy, "steering"
+# LOAN SELECTION -- EXCESS-CALIBRATED (the scientific rule):
+#   Each flagged cell's posterior gap estimates the NUMBER of adverse
+#   outcomes attributable to the disparity: excess = eb_gap x n_group
+#   (e.g. 5.5pp x 5,089 black applicants ~ 280 excess denials). We export
+#   exactly ceiling(excess) loans per cell -- ONE REVIEWED LOAN PER
+#   STATISTICALLY ESTIMATED HARMED LOAN -- prioritized by model surprise
+#   (largest residual first). The count is derived from the evidence, not a
+#   threshold; it scales with institution size AND gap magnitude, and
+#   shrinks where evidence is weak. Pricing: a loan qualifies only if its
+#   individual excess >= the institution's own estimated systematic excess
+#   (and the materiality floor) -- the loans that DRIVE the finding.
+#   Cells without a posterior gap (legacy SAS / steering sources) fall back
+#   to the top decile of adverse residuals.
+pricing_loan_floor <- 0.10  # rate pp; same floor as the screen
+fallback_share     <- 0.10  # top decile for cells lacking eb_gap
+max_per_cell       <- 1000  # hard cap per cell (file-size guard)
 # ------------------------------------------------------------------------------
 
 res   <- readRDS(out("residuals_2025.rds"))
@@ -39,30 +50,69 @@ dat   <- readRDS(out("analysis_2025.rds"))
 # screen (all minority groups at that CU are then mined, as the SAS intended)
 cells <- unique(rbind(
   if ("v2" %in% flag_source)
-    flags[flag == 1, .(lei, group, screen)],
-  if ("sas" %in% flag_source)
-    flags[sas_anomaly == 1,
-          .(group = c("black", "asian", "hispanic")), by = .(lei, screen)],
+    flags[flag == 1, .(lei, group, screen, eb_gap, n_cell = n_g)],
+  if ("sas" %in% flag_source) {
+    sc <- flags[sas_anomaly == 1 & flag != 1,   # avoid double-counting v2
+                .(group = c("black", "asian", "hispanic")),
+                by = .(lei, screen)]
+    # excess-calibrate SAS cells too: the flags table carries eb_gap / n_g
+    # for EVERY tested cell -- a legacy flag with ~0 posterior gap therefore
+    # exports ~0 loans (the calibration absorbs the legacy false flags)
+    sc <- merge(sc, flags[, .(lei, group, screen, eb_gap, n_cell = n_g)],
+                by = c("lei", "group", "screen"), all.x = TRUE)
+    sc
+  },
   if ("steering" %in% flag_source &&
       file.exists(out("steering_flags_2025.csv")))
     fread(out("steering_flags_2025.csv"),
           colClasses = list(character = "lei"))[flag == 1,
-                                                .(lei, group, screen)]
-))
+          .(lei, group, screen, eb_gap = NA_real_, n_cell = NA_integer_)]
+), by = c("lei", "group", "screen"))
 cat(sprintf("Mining %d flagged CU x group x screen cells (source: %s)\n",
             nrow(cells), paste(flag_source, collapse = " + ")))
 
-.pick_loans <- function(rd, resid_col, screen_name, cut) {
+.pick_loans <- function(rd, resid_col, screen_name) {
   r <- merge(rd, cells[screen == screen_name], by = c("lei", "group"))
+  if (!nrow(r)) return(NULL)
   if (!"resid_oth" %in% names(r)) r[, resid_oth := NA_real_]
-  r[get(resid_col) >= cut,
-    .(uli, lei, cu_number, group, loan_cat, screen = screen_name,
-      resid = get(resid_col), resid_oth)]
+  setnames(r, resid_col, ".r")
+  r <- r[.r > 0]                                  # adverse direction only
+  setorder(r, lei, group, -.r)
+  if (screen_name == "pricing") {
+    # CUMULATIVE-MASS ATTRIBUTION: the cell's estimated total excess is
+    # eb_gap x n (rate-pp mass). Export the SMALLEST set of top-residual
+    # loans that jointly account for that excess (each also >= the 10bp
+    # floor). A cell with ~zero posterior gap exports ~zero loans, so
+    # legacy-track false flags contribute nothing at the loan level.
+    r <- r[.r >= pricing_loan_floor]
+    r[, idx := seq_len(.N), by = .(lei, group)]
+    r[, prevcum := cumsum(.r) - .r, by = .(lei, group)]
+    r[, take := fifelse(is.na(eb_gap) | is.na(n_cell),
+                        as.numeric(idx <= ceiling(fallback_share * .N)),
+                        as.numeric(pmax(eb_gap, 0) > 0 &
+                                   prevcum < pmax(eb_gap, 0) * n_cell)),
+      by = .(lei, group)]
+    r <- r[take > 0 & idx <= max_per_cell]
+    r[, c("idx", "prevcum", "take") := NULL]
+    return(r[, .(uli, lei, cu_number, group, loan_cat, screen = screen_name,
+                 resid = .r, resid_oth)])
+  } else {
+    # excess-calibrated count: one loan per estimated excess adverse outcome
+    r[, take := pmin(
+        fifelse(is.na(eb_gap), ceiling(fallback_share * .N),
+                ceiling(pmax(eb_gap, 0) *
+                        fifelse(is.na(n_cell), as.integer(.N), n_cell))),
+        max_per_cell, .N), by = .(lei, group)]
+  }
+  r[, idx := seq_len(.N), by = .(lei, group)]
+  r <- r[idx <= take]
+  r[, .(uli, lei, cu_number, group, loan_cat, screen = screen_name,
+        resid = .r, resid_oth)]
 }
 outliers <- rbind(
-  .pick_loans(res$denial,     "resid_denial",    "denial",     denial_loan_cut),
-  .pick_loans(res$withdrawal, "resid_withdrawn", "withdrawal", withdrawn_loan_cut),
-  .pick_loans(res$pricing,    "resid_price",     "pricing",    pricing_loan_cut)
+  .pick_loans(res$denial,     "resid_denial",    "denial"),
+  .pick_loans(res$withdrawal, "resid_withdrawn", "withdrawal"),
+  .pick_loans(res$pricing,    "resid_price",     "pricing")
 )
 if ("steering" %in% flag_source && file.exists(out("steering_loans_2025.csv"))) {
   st <- fread(out("steering_loans_2025.csv"),
@@ -81,6 +131,11 @@ cat(sprintf("Outlier loans identified: %s\n",
 assets <- fread(out("cu_assets_2025.csv"), colClasses = list(character = "lei"))
 if (!"cu_type" %in% names(assets)) assets[, cu_type := NA_integer_]
 assets[is.na(cu_type), cu_type := 0L]
+if (all(assets$cu_type == 0L))
+  warning("cu_type is UNKNOWN (0) for every CU -- cu_assets_2025.csv predates ",
+          "the cu_type addition. DELETE it and rerun 00_assets.R, then rerun ",
+          "the screen and this script, to get separate federal/state rankings.",
+          call. = FALSE, immediate. = TRUE)
 .nm <- function(x) merge(x, assets[, .(lei, cu_number, name, assets_tot,
                                        cu_type)], by = "lei")
 
