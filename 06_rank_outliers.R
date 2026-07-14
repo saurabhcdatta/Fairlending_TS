@@ -23,6 +23,7 @@ library(data.table)
 source("settings.R")
 
 # ------------------------------- FILTERS (edit here) --------------------------
+stream_tag        <- "popick"        # tagged copies *_<stream>_2025.csv for 07
 flag_source       <- c("v2", "sas")  # "v2" tiers, "sas" legacy, "steering"
 # LOAN SELECTION -- EXCESS-CALIBRATED (the scientific rule):
 #   Each flagged cell's posterior gap estimates the NUMBER of adverse
@@ -155,6 +156,7 @@ rank_tab[, rank := seq_len(.N), by = cu_type]      # rank WITHIN cu_type
 setcolorder(rank_tab, c("cu_type", "rank", "name", "cu_number", "lei",
                         "total_outlier_loans"))
 fwrite(rank_tab, out("outlier_rankings_2025.csv"))
+fwrite(rank_tab, out(sprintf("outlier_rankings_%s_2025.csv", stream_tag)))
 
 # (b) SEPARATE ranking per screen (denial / withdrawal / pricing), with the
 #     product breakdown as columns; rank restarts within each screen
@@ -237,6 +239,7 @@ loans <- merge(outliers, dat[, ..keep_fields], by = "uli", all.x = TRUE)
 #   cu_stated_reason the institution's OWN primary denial reason from HMDA,
 #                   decoded -- lets the reviewer confront claim vs profile
 #                   ("cited credit history; applicant score is 761")
+loans[, stream := stream_tag]
 loans[, model_expected := fifelse(screen %in% c("denial", "withdrawal"),
                                   round(1 - resid, 3), NA_real_)]
 # pricing: what rate the model expected for THIS loan, and where the excess
@@ -257,6 +260,7 @@ setorder(loans, screen, -resid)
 setcolorder(loans, c("name", "lei", "screen", "loan_cat", "group", "uli",
                      "resid"))
 fwrite(loans, out("outlier_loans_2025.csv"))
+fwrite(loans, out(sprintf("outlier_loans_%s_2025.csv", stream_tag)))
 cat(sprintf("\nStage-2 file: %s outlier loans with underwriting fields -> %s\n",
             format(nrow(loans), big.mark = ","), out("outlier_loans_2025.csv")))
 cat("Per-screen breakdown of exported loan IDs:\n")
