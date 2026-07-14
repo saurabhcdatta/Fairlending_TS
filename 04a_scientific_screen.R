@@ -45,6 +45,9 @@ source("settings.R")
 # ------------------------------- FILTERS (edit here) --------------------------
 min_group  <- 20          # minority applications needed at the CU to test
 min_white  <- 50          # white applications needed to compare against
+stream_tag <- "popick"    # which residual stream produced the input:
+                          # "popick" (03a) | "ml" (03b). A tagged copy
+                          # flags_<stream>_2025.csv is written for 07.
 null_type  <- "empirical" # "empirical" (peer-relative) | "theoretical" (vs 0)
 peer_group <- "cu_type"   # "cu_type" | "cluster" (business-model peers from
                           # 03c_unsupervised.R; falls back to cu_type if the
@@ -192,6 +195,9 @@ print(flags[flag == 1, .(cu_type, tier, screen, name, group, n_g,
                          P_mat = round(p_material, 2), q = signif(q, 2),
                          p_perm = signif(p_perm, 2))])
 
+flags[, stream := stream_tag]
 fwrite(flags, out("flags_2025.csv"))
-cat("Saved ->", out("flags_2025.csv"), "(04a scientific screen)\n")
+fwrite(flags, out(sprintf("flags_%s_2025.csv", stream_tag)))
+cat("Saved ->", out("flags_2025.csv"), "+ tagged copy (stream:",
+    stream_tag, ") for 07\n")
 cat("NOTE: run 06_rank_outliers.R with  flag_source <- \"v2\"\n")
