@@ -86,6 +86,8 @@ if (!file.exists(af))
 assets  <- fread(af, colClasses = list(character = "lei"))
 if (!"cu_type" %in% names(assets)) assets[, cu_type := NA_integer_]
 assets[is.na(cu_type), cu_type := 0L]        # unknown type screened together
+if (!is.finite(top_n)) top_n <- .Machine$integer.max  # top_n <- Inf =
+                                                       # screen EVERY CU
 top_uni <- assets[order(-assets_tot), head(.SD, top_n), by = cu_type]
 assets[, peer := cu_type]
 if (peer_group == "cluster" && file.exists(out("peer_clusters_2025.csv"))) {

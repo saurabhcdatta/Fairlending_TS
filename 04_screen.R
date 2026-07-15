@@ -58,6 +58,8 @@ if (!file.exists(af))
 assets  <- fread(af, colClasses = list(character = "lei"))
 if (!"cu_type" %in% names(assets)) assets[, cu_type := NA_integer_]
 assets[is.na(cu_type), cu_type := 0L]
+if (!is.finite(top_n)) top_n <- .Machine$integer.max  # top_n <- Inf =
+                                                       # screen EVERY CU
 top_uni <- assets[order(-assets_tot), head(.SD, top_n), by = cu_type]
 top_lei <- top_uni$lei
 cat("Screening universe per cu_type (1 = federal, 2 = state):\n")
