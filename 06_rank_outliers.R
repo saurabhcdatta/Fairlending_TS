@@ -691,22 +691,24 @@ if (have_ox2 || have_openxlsx || have_writexl) {
     setcolorder(out, c("pair", "row_type"))
     out
   }
+  # ---- SUMMARY BUILDER: per stream, so ML gets the same landing pages ----------
+  .mk_summaries <- function(L, FL) {
   # ---- SUMMARY TAB: the examiner's landing page --------------------------------
-  smy <- loans[, .(
+  smy <- L[, .(
       total_outliers   = .N,
       denials          = sum(screen == "denial"),
       withdrawals      = sum(screen == "withdrawal"),
       pricing          = sum(screen == "pricing"),
       steering         = sum(screen == "steering"),
       extreme_cases    = sum(grepl("^EXTREME", surprise_level)),
-      contradicted_reasons = if ("rebuttal_evidence" %in% names(loans))
+      contradicted_reasons = if ("rebuttal_evidence" %in% names(L))
         sum(grepl("^CONTRADICTED", rebuttal_evidence)) else 0L,
       weaker_profile_pairs = sum(weaker_profile_comparator %in% 1L),
       excess_dollars_yr = sum(excess_rate_dollars_yr, na.rm = TRUE) +
                           sum(excess_fees_dollars, na.rm = TRUE),
       groups_affected  = paste(sort(unique(group)), collapse = ", ")),
     by = .(lei, name)]
-  fl_cu <- flags[, .(minority_records = sum(n_g, na.rm = TRUE),
+  fl_cu <- FL[, .(minority_records = sum(n_g, na.rm = TRUE),
                      high_tier_cells = sum(tier == "high", na.rm = TRUE),
                      strongest_q = suppressWarnings(min(q, na.rm = TRUE))),
                  by = lei]
@@ -728,15 +730,15 @@ if (have_ox2 || have_openxlsx || have_writexl) {
   smy[, rank_in_charter := frank(-total_outliers, ties.method = "first"),
       by = cu_type]
   # (3) enrichments
-  enr <- loans[, .(
+  enr <- L[, .(
       pct_extreme = round(100 * mean(grepl("^EXTREME", surprise_level)), 1),
       top_group = names(sort(table(group), decreasing = TRUE))[1]),
     by = lei]
-  den_enr <- loans[screen == "denial",
+  den_enr <- L[screen == "denial",
     .(median_expected_denial_pct = round(100 * median(model_expected,
                                                       na.rm = TRUE), 1)),
     by = lei]
-  pri_enr <- loans[screen == "pricing",
+  pri_enr <- L[screen == "pricing",
     .(avg_excess_bp = round(100 * mean(resid, na.rm = TRUE), 0),
       avg_excess_dollars_per_loan =
         round(mean(excess_rate_dollars_yr + fifelse(is.na(excess_fees_dollars),
@@ -755,32 +757,31 @@ if (have_ox2 || have_openxlsx || have_writexl) {
                        "avg_excess_dollars_per_loan", "high_tier_cells",
                        "strongest_q", "groups_affected"), names(smy))
   smy <- smy[, ..keepc]
-  fwrite(smy, out("outlier_summary_by_cu_2025.csv"))
-  cat("Summary by CU ->", out("outlier_summary_by_cu_2025.csv"), "\n")
+
   # (1) SEPARATE per-screen ranking sheets
   scr_sum <- list()
   for (sc in c("denial", "withdrawal", "pricing")) {
-    z <- loans[screen == sc,
+    z <- L[screen == sc,
                .(loans = .N,
                  extreme = sum(grepl("^EXTREME", surprise_level)),
                  groups = paste(sort(unique(group)), collapse = ", ")),
                by = .(lei, name)]
     if (!nrow(z)) { scr_sum[[sc]] <- z; next }
     if (sc == "denial") {
-      z2 <- loans[screen == sc,
+      z2 <- L[screen == sc,
         .(contradicted = sum(grepl("^CONTRADICTED", rebuttal_evidence)),
           weaker_pairs = sum(weaker_profile_comparator %in% 1L),
           median_expected_pct = round(100 * median(model_expected,
                                                    na.rm = TRUE), 1)),
         by = lei]
     } else if (sc == "pricing") {
-      z2 <- loans[screen == sc,
+      z2 <- L[screen == sc,
         .(avg_excess_bp = round(100 * mean(resid, na.rm = TRUE), 0),
           total_excess_dollars_yr =
             sum(excess_rate_dollars_yr, na.rm = TRUE) +
             sum(excess_fees_dollars, na.rm = TRUE)), by = lei]
     } else {
-      z2 <- loans[screen == sc,
+      z2 <- L[screen == sc,
         .(median_expected_pct = round(100 * median(model_expected,
                                                    na.rm = TRUE), 1)),
         by = lei]
@@ -788,7 +789,7 @@ if (have_ox2 || have_openxlsx || have_writexl) {
     z <- merge(z, z2, by = "lei")
     z <- merge(z, assets[, .(lei, cu_type, assets_tot)], by = "lei",
                all.x = TRUE)
-    z <- merge(z, flags[screen == sc,
+    z <- merge(z, FL[screen == sc,
                         .(minority_records = sum(n_g, na.rm = TRUE),
                           strongest_q = suppressWarnings(min(q, na.rm = TRUE))),
                         by = lei], by = "lei", all.x = TRUE)
@@ -801,7 +802,6 @@ if (have_ox2 || have_openxlsx || have_writexl) {
                                "per_1000", "extreme", names(z)), names(z)))
     z[, c("lei", "cu_type", "assets_tot") := NULL]
     scr_sum[[sc]] <- z
-    fwrite(z, out(sprintf("outlier_summary_%s_2025.csv", sc)))
   }
   readme <- rbind(readme, data.table(
     column = c("SUMMARY: outliers_per_1000", "SUMMARY: extreme_cases",
@@ -813,10 +813,33 @@ if (have_ox2 || have_openxlsx || have_writexl) {
       "Denials where the CU's stated reason is contradicted by its OWN approved white borrowers",
       "Pricing rows: total excess interest per year + excess fees, in dollars",
       "The single most significant statistical result at this CU (smaller = stronger evidence)")))
-  sheets <- list(ReadMe = readme, Summary = smy,
-                 `Summary Denial` = scr_sum[["denial"]],
-                 `Summary Withdrawal` = scr_sum[["withdrawal"]],
-                 `Summary Pricing` = scr_sum[["pricing"]])
+    list(master = smy, denial = scr_sum[["denial"]],
+         withdrawal = scr_sum[["withdrawal"]],
+         pricing = scr_sum[["pricing"]])
+  }
+  # current stream: unsuffixed CSVs (workflow compatibility)
+  cur <- .mk_summaries(loans, flags)
+  fwrite(cur$master, out("outlier_summary_by_cu_2025.csv"))
+  cat("Summary by CU ->", out("outlier_summary_by_cu_2025.csv"), "\n")
+  for (sc in c("denial", "withdrawal", "pricing"))
+    fwrite(cur[[sc]], out(sprintf("outlier_summary_%s_2025.csv", sc)))
+  # every stream: suffixed CSVs + its own workbook summary tabs
+  sheets <- list(ReadMe = readme)
+  for (st in names(all_streams)) {
+    fst <- if (file.exists(out(sprintf("flags_%s_2025.csv", st)))) {
+      fread(out(sprintf("flags_%s_2025.csv", st)),
+            colClasses = list(character = "lei"))
+    } else flags
+    sm_st <- if (st == stream_tag) cur
+             else .mk_summaries(all_streams[[st]], fst)
+    fwrite(sm_st$master,
+           out(sprintf("outlier_summary_by_cu_%s_2025.csv", st)))
+    stt <- tools::toTitleCase(st)
+    sheets[[paste(stt, "Summary")]] <- sm_st$master
+    for (sc in c("denial", "withdrawal", "pricing"))
+      sheets[[substr(paste(stt, "Summary", tools::toTitleCase(sc)), 1, 31)]] <-
+        sm_st[[sc]]
+  }
   for (st in names(all_streams))
     for (sc in sheet_screens) {
       nmx <- tools::toTitleCase(paste(st, sc))
