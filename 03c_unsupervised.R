@@ -84,17 +84,17 @@ pr <- dat[originated == 1 & !is.na(group) &
 cat(sprintf("\nSteering universe (prime-eligible originations): %s loans\n",
             format(nrow(pr), big.mark = ",")))
 
-pr[, hi_cost := {
+pr[, c("hi_cost", "totz") := {
   Z <- scale(cbind(ir_spread_pmms, disc_pts_pct, -lend_cred_pct,
                    loan_cost_pct))
   Z[!is.finite(Z)] <- 0
+  tot <- rowSums(Z)
   if (.N > 50 * regime_k) {
     cl <- kmeans(Z, centers = regime_k, nstart = 10,
                  iter.max = 100, algorithm = "Lloyd")
-    tot <- rowSums(Z)
     hi <- which.max(tapply(tot, cl$cluster, mean))   # costliest regime
-    as.integer(cl$cluster == hi)
-  } else rep(NA_integer_, .N)
+    list(as.integer(cl$cluster == hi), tot)
+  } else list(rep(NA_integer_, .N), tot)
 }, by = loan_cat]
 pr <- pr[!is.na(hi_cost)]
 cat(sprintf("High-cost regime share overall: %.1f%%\n",
@@ -126,9 +126,16 @@ print(cells[flag == 1, .(name, cu_type, group, n_g,
 
 # per-loan steering outliers: prime-eligible minority loans in the high-cost
 # regime at flagged cells -- for 06 (add "steering" to flag_source there)
+# EXCESS-CALIBRATED, consistent with 06: export ceiling(gap x n_g) loans
+# per flagged cell -- one per estimated excess high-cost placement --
+# worst (costliest) placements first.
 sl <- merge(pr[hi_cost == 1 & group != "white",
-               .(uli, lei, cu_number, group, loan_cat)],
-            cells[flag == 1, .(lei, group)], by = c("lei", "group"))
+               .(uli, lei, cu_number, group, loan_cat, totz)],
+            cells[flag == 1, .(lei, group, gap, n_g)],
+            by = c("lei", "group"))
+setorder(sl, lei, group, -totz)
+sl[, idx := seq_len(.N), by = .(lei, group)]
+sl <- sl[idx <= ceiling(gap * n_g)][, .(uli, lei, cu_number, group, loan_cat)]
 fwrite(sl, out("steering_loans_2025.csv"))
 cat(sprintf("Prime-eligible minority loans in the high-cost regime at flagged CUs: %s -> steering_loans_2025.csv\n",
             format(nrow(sl), big.mark = ",")))

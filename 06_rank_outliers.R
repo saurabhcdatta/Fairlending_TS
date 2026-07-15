@@ -327,8 +327,11 @@ if (file.exists(cf_file)) {
                                                "supporting factor"))]
   lv[, plain_w := sprintf("%s (%s)", plain, weight)]
   good <- lv[estimate < 0][order(estimate),
-             .(outlier_reason = paste(head(lbl, 3), collapse = "; "),
-               reason_plain   = paste(head(plain_w, 3), collapse = "; ")),
+             .(outlier_reason = paste(head(lbl, 4), collapse = "; "),
+               reason_plain   = paste(sprintf("%d) %s",
+                                              seq_len(min(.N, 4)),
+                                              head(plain_w, 4)),
+                                      collapse = "; ")),
              by = uli]
   bad  <- lv[estimate > 0.05][order(-estimate),
              .(risk_factors_present = paste(head(lbl, 2), collapse = "; "),
@@ -354,6 +357,75 @@ if (file.exists(cf_file)) {
 } else cat("(model_coefficients_2025.csv not found -- rerun 03a for",
            "per-loan reasons)
 ")
+# ---- MATCHED COMPARATOR: the classic examination exhibit ----------------------
+# For every outlier, the closest-profile WHITE loan at the SAME CU and SAME
+# product with the GOOD outcome: approved (denial), completed (withdrawal),
+# or priced at/below model expectation (pricing). Match is algorithmic
+# (nearest neighbor on standardized score/DTI/CLTV/amount/income), distance
+# reported, and weaker_profile_comparator = 1 marks the strongest exhibits:
+# the comparator's profile is no better on ANY matched dimension.
+set.seed(20250101)
+dat[, `:=`(.la = log(pmax(loan_amount, 1)), .li = log(pmax(income, 1)))]
+mfeat <- c("credit_score", "dti", "ltv_combined", ".la", ".li")
+pools <- list(
+  denial     = dat[in_denial_universe == TRUE & group == "white" &
+                   denied == 0],
+  withdrawal = dat[in_withdrawal_universe == TRUE & group == "white" &
+                   withdrawn == 0],
+  pricing    = {
+    pw <- res$pricing[!is.na(resid_price) & resid_price <= 0 &
+                      group == "white", .(uli)]
+    dat[uli %in% pw$uli]
+  })
+comp_rows <- list()
+for (sc in intersect(names(pools), unique(loans$screen))) {
+  ol <- loans[screen == sc]
+  po <- pools[[sc]]
+  if (!nrow(ol) || !nrow(po)) next
+  for (key in unique(ol[, paste(lei, loan_cat)])) {
+    oo <- ol[paste(lei, loan_cat) == key]
+    pp <- po[paste(lei, loan_cat) == key]
+    if (!nrow(pp)) next
+    if (nrow(pp) > 5000) pp <- pp[sample(.N, 5000)]
+    mu <- pp[, lapply(.SD, mean, na.rm = TRUE), .SDcols = mfeat]
+    sg <- pp[, lapply(.SD, function(z) pmax(sd(z, na.rm = TRUE), 1e-6)),
+             .SDcols = mfeat]
+    Z  <- as.matrix(pp[, ..mfeat]); O <- as.matrix(oo[, .(credit_score, dti,
+                    ltv_combined, .la = log(pmax(loan_amount, 1)),
+                    .li = log(pmax(income, 1)))])
+    for (j in seq_along(mfeat)) {
+      Z[, j] <- (Z[, j] - mu[[j]]) / sg[[j]]
+      O[, j] <- (O[, j] - mu[[j]]) / sg[[j]]
+    }
+    Z[is.na(Z)] <- 0; O[is.na(O)] <- 0
+    for (i in seq_len(nrow(oo))) {
+      dist2 <- colSums((t(Z) - O[i, ])^2)
+      b <- which.min(dist2)
+      weaker <- as.integer(
+        (is.na(pp$credit_score[b]) | is.na(oo$credit_score[i]) |
+           pp$credit_score[b] <= oo$credit_score[i]) &
+        (is.na(pp$dti[b]) | is.na(oo$dti[i]) | pp$dti[b] >= oo$dti[i]) &
+        (is.na(pp$ltv_combined[b]) | is.na(oo$ltv_combined[i]) |
+           pp$ltv_combined[b] >= oo$ltv_combined[i]))
+      comp_rows[[length(comp_rows) + 1L]] <- data.table(
+        uli = oo$uli[i], comp_uli = pp$uli[b],
+        comp_credit_score = pp$credit_score[b], comp_dti = pp$dti[b],
+        comp_ltv = pp$ltv_combined[b], comp_loan_amount = pp$loan_amount[b],
+        comp_interest_rate = pp$interest_rate[b],
+        comp_outcome = c(denial = "approved", withdrawal = "completed",
+                         pricing = "priced at/below expectation")[[sc]],
+        match_distance = round(sqrt(dist2[b]), 3),
+        weaker_profile_comparator = weaker)
+    }
+  }
+}
+if (length(comp_rows)) {
+  loans <- merge(loans, rbindlist(comp_rows), by = "uli", all.x = TRUE)
+  cat(sprintf("Matched white comparators attached: %s of %s outliers (%s with equal-or-weaker profiles)\n",
+      format(sum(!is.na(loans$comp_uli)), big.mark = ","),
+      format(nrow(loans), big.mark = ","),
+      format(sum(loans$weaker_profile_comparator %in% 1L), big.mark = ",")))
+}
 loans <- merge(loans, assets[, .(lei, name)], by = "lei", all.x = TRUE)
 setorder(loans, screen, -resid)
 setcolorder(loans, c("name", "lei", "screen", "loan_cat", "group", "uli",
@@ -393,8 +465,40 @@ if (requireNamespace("writexl", quietly = TRUE)) {
       "Technical version of reason_plain (model log-odds contributions)",
       "Technical version of risk_plain",
       "Which analysis stream produced this row (popick / ml)"))
+  readme <- rbind(readme, data.table(
+    column = c("pair", "row_type", "comp_uli", "match_distance",
+               "weaker_profile_comparator"),
+    what_it_means = c(
+      "Links each outlier to the comparator row directly beneath it",
+      "OUTLIER = the flagged loan; '-> comparator' = the matched white loan at the same CU/product with the good outcome",
+      "Loan ID of the matched white comparator",
+      "How similar the two profiles are (0 = identical; computed on score, DTI, CLTV, amount, income)",
+      "1 = the comparator's profile was equal or WEAKER on every matched dimension -- the strongest exhibits")))
+  .interleave <- function(x) {
+    if (!nrow(x) || !"comp_uli" %in% names(x)) {
+      if (nrow(x)) x[, `:=`(pair = .I, row_type = "OUTLIER")]
+      return(x)
+    }
+    x[, pair := .I]
+    x[, row_type := "OUTLIER"]
+    cmp <- x[!is.na(comp_uli),
+             .(pair, row_type = "-> comparator (white, good outcome)",
+               name, lei, screen, loan_cat, group = "white", uli = comp_uli,
+               credit_score = comp_credit_score, dti = comp_dti,
+               ltv_combined = comp_ltv, loan_amount = comp_loan_amount,
+               interest_rate = comp_interest_rate,
+               reason_plain = fifelse(weaker_profile_comparator == 1L,
+                 "COMPARATOR: same CU, same product, equal-or-WEAKER profile -- good outcome",
+                 "COMPARATOR: same CU, same product, closest profile -- good outcome"),
+               match_distance)]
+    out <- rbind(x, cmp, fill = TRUE)
+    setorder(out, pair, row_type)     # OUTLIER sorts before "-> comparator"
+    setcolorder(out, c("pair", "row_type"))
+    out
+  }
   sheets <- c(list(readme),
-              lapply(sheet_screens, function(sc) loans[screen == sc]))
+              lapply(sheet_screens, function(sc)
+                .interleave(copy(loans[screen == sc]))))
   names(sheets) <- tools::toTitleCase(c("ReadMe", sheet_screens))
   writexl::write_xlsx(sheets, out("outlier_loans_2025.xlsx"))
   cat("Workbook with one worksheet per screen ->",
