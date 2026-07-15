@@ -26,6 +26,8 @@ cat("== 06_rank_outliers.R VERSION 2026-07-15a",
 source("settings.R")
 
 # ------------------------------- FILTERS (edit here) --------------------------
+if (!exists("workbook_only")) workbook_only <- FALSE  # 07 sets TRUE to
+                                     # rebuild tabs from disk, no mining
 if (!exists("stream_tag"))           # wrappers 06a/06b pre-set this
   stream_tag      <- "popick"        # tagged copies *_<stream>_2025.csv for 07
 flag_source       <- c("v2", "sas")  # "v2" tiers, "sas" legacy, "steering"
@@ -47,6 +49,7 @@ fallback_share     <- 0.10  # top decile for cells lacking eb_gap
 max_per_cell       <- 1000  # hard cap per cell (file-size guard)
 # ------------------------------------------------------------------------------
 
+if (!workbook_only) {
 # STREAM-CONSISTENT INPUTS: each stream mines ITS OWN residuals and ITS OWN
 # flags -- never whichever file happened to be written last.
 res_file <- if (stream_tag == "ml" &&
@@ -591,6 +594,20 @@ sheet_screens <- union(c("denial", "withdrawal", "pricing"),
 for (sc in sheet_screens)
   fwrite(loans[screen == sc],
          out(sprintf("outlier_loans_%s_sheet_2025.csv", sc)))
+} else {
+  cat("[06] WORKBOOK-ONLY refresh: assembling tabs from stream files\n")
+  assets <- fread(out("cu_assets_2025.csv"),
+                  colClasses = list(character = "lei"))
+  if (!"cu_type" %in% names(assets)) assets[, cu_type := 0L]
+  assets[is.na(cu_type), cu_type := 0L]
+  flags <- if (file.exists(out("flags_2025.csv"))) {
+    fread(out("flags_2025.csv"), colClasses = list(character = "lei"))
+  } else data.table(lei = character(), screen = character(),
+                    n_g = integer(), q = numeric(), tier = character())
+  stream_tag <- "__refresh__"
+  sheet_screens <- c("denial", "withdrawal", "pricing")
+}
+
 have_ox2      <- requireNamespace("openxlsx2", quietly = TRUE)
 have_openxlsx <- requireNamespace("openxlsx",  quietly = TRUE)
 have_writexl  <- requireNamespace("writexl",   quietly = TRUE)
@@ -839,11 +856,13 @@ if (have_ox2 || have_openxlsx || have_writexl) {
          pricing = scr_sum[["pricing"]])
   }
   # current stream: unsuffixed CSVs (workflow compatibility)
-  cur <- .mk_summaries(loans, flags)
-  fwrite(cur$master, out("outlier_summary_by_cu_2025.csv"))
-  cat("Summary by CU ->", out("outlier_summary_by_cu_2025.csv"), "\n")
-  for (sc in c("denial", "withdrawal", "pricing"))
-    fwrite(cur[[sc]], out(sprintf("outlier_summary_%s_2025.csv", sc)))
+  if (!workbook_only) {
+    cur <- .mk_summaries(loans, flags)
+    fwrite(cur$master, out("outlier_summary_by_cu_2025.csv"))
+    cat("Summary by CU ->", out("outlier_summary_by_cu_2025.csv"), "\n")
+    for (sc in c("denial", "withdrawal", "pricing"))
+      fwrite(cur[[sc]], out(sprintf("outlier_summary_%s_2025.csv", sc)))
+  }
   # every stream: suffixed CSVs + its own workbook summary tabs
   sheets <- list(ReadMe = readme)
   for (st in names(all_streams)) {

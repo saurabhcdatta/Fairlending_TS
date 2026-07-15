@@ -154,9 +154,13 @@ if (length(rich)) {
     fu[, src_pref := NULL]
     fwrite(fu, out("flags_ensemble_2025.csv"))
   }
-  cat(sprintf("Ensemble promoted to stream: %s rich loans (%s robust) ->\n  outlier_loans_ensemble_2025.csv + flags_ensemble_2025.csv\n  RERUN 06a OR 06b to add Ensemble tabs to the workbook.\n",
+  cat(sprintf("Ensemble promoted to stream: %s rich loans (%s robust)\n",
               format(nrow(ens_loans), big.mark = ","),
               format(sum(ens_loans$robust), big.mark = ",")))
+  # build the FULL multi-tab workbook right now (06 engine, no mining)
+  workbook_only <- TRUE
+  source("06_rank_outliers.R")
+  rm(workbook_only)
 }
 
 cat("\nRobust tier = flagged by >=", robust_min_streams, "streams.",
