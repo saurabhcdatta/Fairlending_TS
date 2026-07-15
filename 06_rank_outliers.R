@@ -634,9 +634,15 @@ if (have_ox2 || have_openxlsx || have_writexl) {
                match_distance)]
     spacer <- x[, .(pair, row_type = "zz_spacer")]    # blank line per pair
     out <- rbind(x, cmp, spacer, fill = TRUE)
-    setorder(out, pair, row_type)   # OUTLIER < "-> comparator" < zz_spacer
-    for (cc in setdiff(names(out), "pair"))
-      out[row_type == "zz_spacer", (cc) := NA]
+    # explicit ordering key: OUTLIER first, its comparator beneath, spacer
+    # last ("-"(0x2D) < "O"(0x4F) in ASCII, so a plain sort inverts pairs)
+    out[, .ord := fifelse(row_type == "OUTLIER", 1L,
+                  fifelse(startsWith(row_type, "->"), 2L, 3L))]
+    setorder(out, pair, .ord)
+    out[, .ord := NULL]
+    sp_idx <- which(out$row_type == "zz_spacer")   # freeze rows BEFORE the
+    for (cc in setdiff(names(out), "pair"))        # loop clears row_type
+      set(out, i = sp_idx, j = cc, value = NA)
     # comparator values live on their own row; comp_ columns are redundant
     dropc <- grep("^comp_", names(out), value = TRUE)
     if (length(dropc)) out[, (dropc) := NULL]
@@ -713,7 +719,8 @@ if (have_ox2 || have_openxlsx || have_writexl) {
       wb <- openxlsx2::wb_workbook()
       for (nm in names(sheets)) {
         wb <- openxlsx2::wb_add_worksheet(wb, nm)
-        wb <- openxlsx2::wb_add_data(wb, sheet = nm, x = sheets[[nm]])
+        wb <- openxlsx2::wb_add_data(wb, sheet = nm, x = sheets[[nm]],
+                                     na.strings = "")   # blanks, not #N/A
         if ("row_type" %in% names(sheets[[nm]])) {
           rt <- sheets[[nm]]$row_type
           cc <- which(!is.na(rt) & startsWith(rt, "->")) + 1L
