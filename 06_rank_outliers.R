@@ -653,9 +653,17 @@ if (have_ox2 || have_openxlsx || have_writexl) {
   for (st in c("popick", "ml")) {
     f <- out(sprintf("outlier_loans_%s_2025.csv", st))
     if (st == stream_tag) all_streams[[st]] <- loans
-    else if (file.exists(f))
-      all_streams[[st]] <- fread(f, colClasses = list(character =
-                                                      c("lei", "uli")))
+    else if (file.exists(f)) {
+      z <- fread(f, colClasses = list(character = c("lei", "uli")))
+      # schema guard: a file from an older 06 version lacks current columns
+      # and would crash the tabs -- skip it with instructions instead
+      sentinel <- c("what_happened", "surprise_level", "reason_plain")
+      if (all(sentinel %in% names(z))) all_streams[[st]] <- z
+      else cat(sprintf(
+        "!! %s is from an OLDER 06 version (missing: %s) -- skipping its tabs.\n   Rerun 06%s to regenerate it with the current schema.\n",
+        basename(f), paste(setdiff(sentinel, names(z)), collapse = ", "),
+        if (st == "popick") "a" else "b"))
+    }
   }
   .interleave <- function(x) {
     if (!nrow(x) || !"comp_uli" %in% names(x)) {
@@ -693,6 +701,19 @@ if (have_ox2 || have_openxlsx || have_writexl) {
   }
   # ---- SUMMARY BUILDER: per stream, so ML gets the same landing pages ----------
   .mk_summaries <- function(L, FL) {
+    L <- copy(L)
+    # HARDEN TYPES: cross-stream tables arrive via fread, where an all-empty
+    # column reads as logical and fifelse(0, <logical>) errors
+    for (cc in c("resid", "model_expected", "excess_rate_dollars_yr",
+                 "excess_fees_dollars", "weaker_profile_comparator")) {
+      if (!cc %in% names(L)) L[, (cc) := NA_real_]
+      else if (!is.numeric(L[[cc]]))
+        L[, (cc) := suppressWarnings(as.numeric(get(cc)))]
+    }
+    for (cc in c("surprise_level", "rebuttal_evidence", "group")) {
+      if (!cc %in% names(L)) L[, (cc) := ""]
+      else if (!is.character(L[[cc]])) L[, (cc) := as.character(get(cc))]
+    }
   # ---- SUMMARY TAB: the examiner's landing page --------------------------------
   smy <- L[, .(
       total_outliers   = .N,
