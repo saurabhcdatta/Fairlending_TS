@@ -20,6 +20,9 @@
 
 library(data.table)
 
+cat("== 06_rank_outliers.R VERSION 2026-07-15a",
+    "(multi-tab workbook + Summary + rebuttal w/ model context) ==\n")
+
 source("settings.R")
 
 # ------------------------------- FILTERS (edit here) --------------------------
@@ -725,7 +728,9 @@ if (have_openxlsx || have_writexl) {
     wrote_styled <- tryCatch({
       openxlsx::saveWorkbook(wb, out("outlier_loans_2025.xlsx"),
                              overwrite = TRUE); TRUE },
-      error = function(e) FALSE)
+      error = function(e) {
+        cat("!! openxlsx save FAILED:", conditionMessage(e),
+            "\n   (falling back to writexl if available)\n"); FALSE })
     if (wrote_styled)
       cat("STYLED workbook (outliers bold, comparators shaded) ->",
           out("outlier_loans_2025.xlsx"), "\n")
@@ -735,10 +740,15 @@ if (have_openxlsx || have_writexl) {
     cat("Workbook (plain; install.packages('openxlsx') for shading) ->",
         out("outlier_loans_2025.xlsx"), "\n")
   }
-  if (wrote_styled || have_writexl)
+  if (!wrote_styled && !have_writexl)
+    cat("!! WORKBOOK NOT WRITTEN: openxlsx failed and writexl is not",
+        "installed. Run install.packages('writexl') and rerun.\n")
+  if (wrote_styled || have_writexl) {
+    cat("Sheets written:", paste(names(sheets), collapse = ", "), "\n")
     cat("==> OPEN THIS FILE IN EXCEL:", out("outlier_loans_2025.xlsx"),
         "\n    (the .csv files are flat exports; the WORKBOOK with",
         "Summary/ReadMe/per-screen tabs is the .xlsx)\n")
+  }
 } else cat("(NO EXCEL WRITER INSTALLED -- only flat CSVs were produced.\n",
            "  Run:  install.packages('openxlsx')   (styled workbook)\n",
            "  or:   install.packages('writexl')    (plain workbook)\n",
