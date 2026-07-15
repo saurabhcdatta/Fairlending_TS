@@ -650,7 +650,7 @@ if (have_ox2 || have_openxlsx || have_writexl) {
     what_it_means = "Factors ranked 1) strongest to 4): why the model expected the GOOD outcome for this borrower"))
   # gather ALL streams whose tagged loan files exist (this run + prior runs)
   all_streams <- list()
-  for (st in c("popick", "ml")) {
+  for (st in c("popick", "ml", "ensemble")) {
     f <- out(sprintf("outlier_loans_%s_2025.csv", st))
     if (st == stream_tag) all_streams[[st]] <- loans
     else if (file.exists(f)) {

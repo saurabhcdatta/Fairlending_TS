@@ -115,6 +115,50 @@ for (ct in sort(unique(rk$cu_type))) {
   print(rk[cu_type == ct][1:min(5, .N),
            .(rank, name, robust_loans, total_loans)])
 }
+# ---- promote the ensemble to a FIRST-CLASS STREAM for the 06 workbook ---------
+# Rich loan rows (underwriting, reasons, rebuttal, comparator) come from the
+# source streams -- Popick preferred as model of record -- plus the ensemble
+# columns. flags_ensemble is the deduped union of stream flags. The next
+# 06a/06b run then adds Ensemble Summary + per-screen tabs automatically.
+rich <- list()
+for (st in c("popick", "ml")) {
+  f <- out(sprintf("outlier_loans_%s_2025.csv", st))
+  if (file.exists(f)) {
+    z <- fread(f, colClasses = list(character = c("lei", "uli")))
+    if ("what_happened" %in% names(z)) rich[[st]] <- z[, src_pref := 
+                                          fifelse(st == "popick", 1L, 2L)]
+  }
+}
+if (length(rich)) {
+  rl <- rbindlist(rich, use.names = TRUE, fill = TRUE)
+  setorder(rl, src_pref)
+  rl <- unique(rl, by = "uli")
+  ens_loans <- merge(rl,
+                     loan_ens[, .(uli, streams, n_streams, robust)],
+                     by = "uli")
+  ens_loans[, src_pref := NULL]
+  ens_loans[, stream := "ensemble"]
+  setorder(ens_loans, -robust, -n_streams, screen)
+  fwrite(ens_loans, out("outlier_loans_ensemble_2025.csv"))
+  ff <- list()
+  for (st in c("popick", "ml")) {
+    f <- out(sprintf("flags_%s_2025.csv", st))
+    if (file.exists(f)) ff[[st]] <- fread(f,
+                          colClasses = list(character = "lei"))[,
+                          src_pref := fifelse(st == "popick", 1L, 2L)]
+  }
+  if (length(ff)) {
+    fu <- rbindlist(ff, use.names = TRUE, fill = TRUE)
+    setorder(fu, src_pref, q)
+    fu <- unique(fu, by = c("lei", "group", "screen"))
+    fu[, src_pref := NULL]
+    fwrite(fu, out("flags_ensemble_2025.csv"))
+  }
+  cat(sprintf("Ensemble promoted to stream: %s rich loans (%s robust) ->\n  outlier_loans_ensemble_2025.csv + flags_ensemble_2025.csv\n  RERUN 06a OR 06b to add Ensemble tabs to the workbook.\n",
+              format(nrow(ens_loans), big.mark = ","),
+              format(sum(ens_loans$robust), big.mark = ",")))
+}
+
 cat("\nRobust tier = flagged by >=", robust_min_streams, "streams.",
     "Single-stream findings remain in ensemble_loans (robust = 0) --",
     "steering catches placement patterns level-screens cannot.\n")
