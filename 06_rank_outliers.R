@@ -549,9 +549,10 @@ sheet_screens <- union(c("denial", "withdrawal", "pricing"),
 for (sc in sheet_screens)
   fwrite(loans[screen == sc],
          out(sprintf("outlier_loans_%s_sheet_2025.csv", sc)))
-have_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
-have_writexl  <- requireNamespace("writexl",  quietly = TRUE)
-if (have_openxlsx || have_writexl) {
+have_ox2      <- requireNamespace("openxlsx2", quietly = TRUE)
+have_openxlsx <- requireNamespace("openxlsx",  quietly = TRUE)
+have_writexl  <- requireNamespace("writexl",   quietly = TRUE)
+if (have_ox2 || have_openxlsx || have_writexl) {
   readme <- data.table(
     column = c("name", "screen", "group", "uli", "resid", "model_expected",
                "model_expected_rate", "excess_other_costs_pct",
@@ -707,7 +708,33 @@ if (have_openxlsx || have_writexl) {
         .interleave(copy(all_streams[[st]][screen == sc]))
     }
   wrote_styled <- FALSE
-  if (have_openxlsx) {
+  if (have_ox2) {
+    wrote_styled <- tryCatch({
+      wb <- openxlsx2::wb_workbook()
+      for (nm in names(sheets)) {
+        wb <- openxlsx2::wb_add_worksheet(wb, nm)
+        wb <- openxlsx2::wb_add_data(wb, sheet = nm, x = sheets[[nm]])
+        if ("row_type" %in% names(sheets[[nm]])) {
+          rt <- sheets[[nm]]$row_type
+          cc <- which(!is.na(rt) & startsWith(rt, "->")) + 1L
+          nc <- ncol(sheets[[nm]])
+          for (r in cc)
+            wb <- openxlsx2::wb_add_fill(wb, sheet = nm,
+                    dims = openxlsx2::wb_dims(rows = r, cols = seq_len(nc)),
+                    color = openxlsx2::wb_color(hex = "FFDCE9F7"))
+        }
+      }
+      openxlsx2::wb_save(wb, out("outlier_loans_2025.xlsx"),
+                         overwrite = TRUE)
+      TRUE
+    }, error = function(e) {
+      cat("!! openxlsx2 save FAILED:", conditionMessage(e),
+          "\n   (trying openxlsx / writexl next)\n"); FALSE })
+    if (wrote_styled)
+      cat("STYLED workbook via openxlsx2 (comparators shaded) ->",
+          out("outlier_loans_2025.xlsx"), "\n")
+  }
+  if (!wrote_styled && have_openxlsx) {
     wb <- openxlsx::createWorkbook()
     st_out <- openxlsx::createStyle(textDecoration = "bold")
     st_cmp <- openxlsx::createStyle(fgFill = "#DCE9F7")
