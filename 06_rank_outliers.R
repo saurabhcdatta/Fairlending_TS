@@ -435,8 +435,21 @@ loans <- merge(loans, assets[, .(lei, name)], by = "lei", all.x = TRUE)
 # record. Reasons HMDA cannot observe (cash, employment, verification,
 # completeness) are labeled not testable -- honesty preserves credibility.
 loans <- merge(loans, wbench, by = c("lei", "loan_cat"), all.x = TRUE)
-.reb <- function(reason, cs, dti, ltv, ccs, cdti, cltv, mcs, mdti, mltv) {
-  if (is.na(reason)) return("")
+.reb <- function(reason, cs, dti, ltv, ccs, cdti, cltv, mcs, mdti, mltv,
+                 me, factor1, weaker) {
+  ctx <- sprintf("Model context: %.1f%% predicted denial odds%s%s",
+                 100 * me,
+                 if (nzchar(factor1)) paste0("; top strength: ", factor1)
+                 else "",
+                 if (!is.na(weaker) && weaker == 1L)
+                   "; white comparator APPROVED with equal-or-weaker profile"
+                 else if (!is.na(ccs))
+                   "; closest white comparator approved" else "")
+  if (is.na(reason) || reason == 10)
+    return(paste("NO SPECIFIC REASON REPORTED -- Reg B requires specific",
+                 "adverse-action reasons.", ctx))
+  if (reason == 9)
+    return(paste("Stated reason 'other' (unspecific).", ctx))
   if (reason == 3) {          # credit history: higher score = stronger
     if (is.na(cs) || is.na(mcs)) return("stated reason: credit history (score unavailable)")
     tag <- if (!is.na(ccs) && cs >= mcs && cs >= ccs) "CONTRADICTED" else
@@ -461,20 +474,25 @@ loans <- merge(loans, wbench, by = c("lei", "loan_cat"), all.x = TRUE)
             tag, ltv, mltv,
             if (!is.na(cltv)) sprintf(" and approved comparator %.0f", cltv)
             else "")
-  } else sprintf("stated reason (%s) not testable in HMDA data",
-                 c("1" = "DTI", "2" = "employment history",
-                   "3" = "credit history", "4" = "collateral",
-                   "5" = "insufficient cash", "6" = "unverifiable info",
-                   "7" = "application incomplete",
-                   "8" = "mortgage insurance denied", "9" = "other",
-                   "10" = "n/a")[as.character(reason)])
+  } else paste0("Stated reason (",
+                c("1" = "DTI", "2" = "employment history",
+                  "3" = "credit history", "4" = "collateral",
+                  "5" = "insufficient cash", "6" = "unverifiable info",
+                  "7" = "application incomplete",
+                  "8" = "mortgage insurance denied")[as.character(reason)],
+                ") not directly testable in HMDA. ", ctx)
 }
 if ("denial_reason1" %in% names(loans)) {
   loans[screen == "denial",
         rebuttal_evidence := mapply(.reb, denial_reason1, credit_score, dti,
                                     ltv_combined, comp_credit_score,
                                     comp_dti, comp_ltv, med_cs, med_dti,
-                                    med_ltv)]
+                                    med_ltv, model_expected,
+                                    fifelse(nzchar(reason_plain),
+                                      sub(";.*$", "",
+                                          sub("^1\\) ", "", reason_plain)),
+                                      ""),
+                                    weaker_profile_comparator)]
   loans[is.na(rebuttal_evidence), rebuttal_evidence := ""]
   cat(sprintf("Rebuttal evidence: %d stated reasons CONTRADICTED by the CU's own approvals\n",
               loans[grepl("^CONTRADICTED", rebuttal_evidence), .N]))
@@ -528,7 +546,9 @@ sheet_screens <- union(c("denial", "withdrawal", "pricing"),
 for (sc in sheet_screens)
   fwrite(loans[screen == sc],
          out(sprintf("outlier_loans_%s_sheet_2025.csv", sc)))
-if (requireNamespace("writexl", quietly = TRUE)) {
+have_openxlsx <- requireNamespace("openxlsx", quietly = TRUE)
+have_writexl  <- requireNamespace("writexl",  quietly = TRUE)
+if (have_openxlsx || have_writexl) {
   readme <- data.table(
     column = c("name", "screen", "group", "uli", "resid", "model_expected",
                "model_expected_rate", "excess_other_costs_pct",
@@ -571,6 +591,14 @@ if (requireNamespace("writexl", quietly = TRUE)) {
       "1 = the most unexpected loan at that credit union for that screen -- start here",
       "Pricing: extra interest dollars PER YEAR implied by the rate excess on this loan",
       "Pricing: extra upfront fees in dollars (points - credits + costs beyond expectation)")))
+  readme <- rbind(readme, data.table(
+    column = "rebuttal_evidence",
+    what_it_means = paste(
+      "Tests the CU's stated denial reason against its OWN approvals:",
+      "CONTRADICTED / QUESTIONABLE / consistent. Reasons HMDA cannot test",
+      "get MODEL CONTEXT (predicted denial odds, top strength, comparator",
+      "outcome). A denial with NO applicable reason is itself flagged --",
+      "Reg B requires specific adverse-action reasons")))
   readme <- rbind(readme, data.table(
     column = "reason_plain",
     what_it_means = "Factors ranked 1) strongest to 4): why the model expected the GOOD outcome for this borrower"))
@@ -676,7 +704,7 @@ if (requireNamespace("writexl", quietly = TRUE)) {
         .interleave(copy(all_streams[[st]][screen == sc]))
     }
   wrote_styled <- FALSE
-  if (requireNamespace("openxlsx", quietly = TRUE)) {
+  if (have_openxlsx) {
     wb <- openxlsx::createWorkbook()
     st_out <- openxlsx::createStyle(textDecoration = "bold")
     st_cmp <- openxlsx::createStyle(fgFill = "#DCE9F7")
@@ -702,14 +730,19 @@ if (requireNamespace("writexl", quietly = TRUE)) {
       cat("STYLED workbook (outliers bold, comparators shaded) ->",
           out("outlier_loans_2025.xlsx"), "\n")
   }
-  if (!wrote_styled) {
+  if (!wrote_styled && have_writexl) {
     writexl::write_xlsx(sheets, out("outlier_loans_2025.xlsx"))
     cat("Workbook (plain; install.packages('openxlsx') for shading) ->",
         out("outlier_loans_2025.xlsx"), "\n")
   }
-} else cat("(writexl not installed -- per-screen CSVs written instead;",
-           "install.packages('writexl') for a single workbook)
-")
+  if (wrote_styled || have_writexl)
+    cat("==> OPEN THIS FILE IN EXCEL:", out("outlier_loans_2025.xlsx"),
+        "\n    (the .csv files are flat exports; the WORKBOOK with",
+        "Summary/ReadMe/per-screen tabs is the .xlsx)\n")
+} else cat("(NO EXCEL WRITER INSTALLED -- only flat CSVs were produced.\n",
+           "  Run:  install.packages('openxlsx')   (styled workbook)\n",
+           "  or:   install.packages('writexl')    (plain workbook)\n",
+           "  then rerun this script for the multi-tab .xlsx.)\n")
 cat(sprintf("\nStage-2 file: %s outlier loans with underwriting fields -> %s\n",
             format(nrow(loans), big.mark = ","), out("outlier_loans_2025.csv")))
 cat("Per-screen breakdown of exported loan IDs:\n")
