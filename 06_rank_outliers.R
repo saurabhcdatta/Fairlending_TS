@@ -26,7 +26,8 @@ cat("== 06_rank_outliers.R VERSION 2026-07-15a",
 source("settings.R")
 
 # ------------------------------- FILTERS (edit here) --------------------------
-stream_tag        <- "popick"        # tagged copies *_<stream>_2025.csv for 07
+if (!exists("stream_tag"))           # wrappers 06a/06b pre-set this
+  stream_tag      <- "popick"        # tagged copies *_<stream>_2025.csv for 07
 flag_source       <- c("v2", "sas")  # "v2" tiers, "sas" legacy, "steering"
 # LOAN SELECTION -- EXCESS-CALIBRATED (the scientific rule):
 #   Each flagged cell's posterior gap estimates the NUMBER of adverse
@@ -46,8 +47,25 @@ fallback_share     <- 0.10  # top decile for cells lacking eb_gap
 max_per_cell       <- 1000  # hard cap per cell (file-size guard)
 # ------------------------------------------------------------------------------
 
-res   <- readRDS(out("residuals_2025.rds"))
-flags <- fread(out("flags_2025.csv"), colClasses = list(character = "lei"))
+# STREAM-CONSISTENT INPUTS: each stream mines ITS OWN residuals and ITS OWN
+# flags -- never whichever file happened to be written last.
+res_file <- if (stream_tag == "ml" &&
+                file.exists(out("residuals_ml_2025.rds"))) {
+  out("residuals_ml_2025.rds")
+} else if (stream_tag == "popick" &&
+           file.exists(out("residuals_econ_2025.rds"))) {
+  out("residuals_econ_2025.rds")     # econ backup after 03b's swap
+} else out("residuals_2025.rds")
+flags_file <- if (file.exists(out(sprintf("flags_%s_2025.csv", stream_tag)))) {
+  out(sprintf("flags_%s_2025.csv", stream_tag))
+} else out("flags_2025.csv")
+cat(sprintf("[stream %s] residuals: %s | flags: %s\n", stream_tag,
+            basename(res_file), basename(flags_file)))
+if (!grepl(stream_tag, flags_file))
+  cat("  NOTE: stream-tagged flags not found; using flags_2025.csv --",
+      "run 04a with this stream_tag first for strict separation.\n")
+res   <- readRDS(res_file)
+flags <- fread(flags_file, colClasses = list(character = "lei"))
 dat   <- readRDS(out("analysis_2025.rds"))
 
 # cells to mine: v2 flags are CU x group x screen; SAS anomalies are CU x
