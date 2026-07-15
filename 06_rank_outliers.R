@@ -525,6 +525,30 @@ loans[screen == "pricing" & !is.na(excess_other_costs_pct),
       excess_fees_dollars := round(excess_other_costs_pct / 100 * loan_amount)]
 loans[, review_priority := frank(-resid, ties.method = "first"),
       by = .(lei, screen)]
+# pricing: "not applicable" is CORRECT HMDA reporting for an origination --
+# the case is PRICE, so the rebuttal argues in the loan's own numbers
+loans[screen == "pricing",
+      rebuttal_evidence := sprintf(
+        paste0("PRICE CASE (originated, so no denial reason applies): paid ",
+               "%.3f%% vs %.3f%% model-expected (+%.0f bp = $%s/yr excess",
+               "%s)%s"),
+        interest_rate, model_expected_rate, 100 * resid,
+        format(excess_rate_dollars_yr, big.mark = ","),
+        fifelse(!is.na(excess_fees_dollars) & excess_fees_dollars > 0,
+                sprintf(" + $%s excess fees",
+                        format(excess_fees_dollars, big.mark = ",")), ""),
+        fifelse(!is.na(comp_interest_rate),
+                sprintf("; matched white borrower at this CU paid %.3f%%",
+                        comp_interest_rate), ""))]
+loans[screen == "withdrawal",
+      rebuttal_evidence := sprintf(
+        paste0("WITHDRAWAL CASE (HMDA collects no institution reason): ",
+               "model gave %.1f%% withdrawal odds; review question is ",
+               "processing -- quote timeliness, follow-up, rate honored%s"),
+        100 * (1 - resid),
+        fifelse(!is.na(comp_uli),
+                "; comparable white applicant at this CU completed", ""))]
+
 setorder(loans, screen, -resid)
 # (2) comparator variables NEXT TO their outlier counterparts
 .pairs <- c("name", "screen", "loan_cat", "group", "uli", "review_priority",
@@ -685,17 +709,82 @@ if (have_ox2 || have_openxlsx || have_writexl) {
   smy[, rank_overall := .I]
   smy[, rank_in_charter := frank(-total_outliers, ties.method = "first"),
       by = cu_type]
+  # (3) enrichments
+  enr <- loans[, .(
+      pct_extreme = round(100 * mean(grepl("^EXTREME", surprise_level)), 1),
+      top_group = names(sort(table(group), decreasing = TRUE))[1]),
+    by = lei]
+  den_enr <- loans[screen == "denial",
+    .(median_expected_denial_pct = round(100 * median(model_expected,
+                                                      na.rm = TRUE), 1)),
+    by = lei]
+  pri_enr <- loans[screen == "pricing",
+    .(avg_excess_bp = round(100 * mean(resid, na.rm = TRUE), 0),
+      avg_excess_dollars_per_loan =
+        round(mean(excess_rate_dollars_yr + fifelse(is.na(excess_fees_dollars),
+                                                    0, excess_fees_dollars),
+                   na.rm = TRUE))), by = lei]
+  for (e in list(enr, den_enr, pri_enr)) smy <- merge(smy, e, by = "lei",
+                                                      all.x = TRUE)
   keepc <- intersect(c("rank_overall", "rank_in_charter", "name", "charter",
                        "assets_B", "total_outliers", "denials",
                        "withdrawals", "pricing", "steering",
                        if ("robust_loans" %in% names(smy)) "robust_loans",
                        "outliers_per_1000", "extreme_cases",
                        "contradicted_reasons", "weaker_profile_pairs",
-                       "excess_dollars_yr", "high_tier_cells",
+                       "excess_dollars_yr", "pct_extreme", "top_group",
+                       "median_expected_denial_pct", "avg_excess_bp",
+                       "avg_excess_dollars_per_loan", "high_tier_cells",
                        "strongest_q", "groups_affected"), names(smy))
   smy <- smy[, ..keepc]
   fwrite(smy, out("outlier_summary_by_cu_2025.csv"))
   cat("Summary by CU ->", out("outlier_summary_by_cu_2025.csv"), "\n")
+  # (1) SEPARATE per-screen ranking sheets
+  scr_sum <- list()
+  for (sc in c("denial", "withdrawal", "pricing")) {
+    z <- loans[screen == sc,
+               .(loans = .N,
+                 extreme = sum(grepl("^EXTREME", surprise_level)),
+                 groups = paste(sort(unique(group)), collapse = ", ")),
+               by = .(lei, name)]
+    if (!nrow(z)) { scr_sum[[sc]] <- z; next }
+    if (sc == "denial") {
+      z2 <- loans[screen == sc,
+        .(contradicted = sum(grepl("^CONTRADICTED", rebuttal_evidence)),
+          weaker_pairs = sum(weaker_profile_comparator %in% 1L),
+          median_expected_pct = round(100 * median(model_expected,
+                                                   na.rm = TRUE), 1)),
+        by = lei]
+    } else if (sc == "pricing") {
+      z2 <- loans[screen == sc,
+        .(avg_excess_bp = round(100 * mean(resid, na.rm = TRUE), 0),
+          total_excess_dollars_yr =
+            sum(excess_rate_dollars_yr, na.rm = TRUE) +
+            sum(excess_fees_dollars, na.rm = TRUE)), by = lei]
+    } else {
+      z2 <- loans[screen == sc,
+        .(median_expected_pct = round(100 * median(model_expected,
+                                                   na.rm = TRUE), 1)),
+        by = lei]
+    }
+    z <- merge(z, z2, by = "lei")
+    z <- merge(z, assets[, .(lei, cu_type, assets_tot)], by = "lei",
+               all.x = TRUE)
+    z <- merge(z, flags[screen == sc,
+                        .(minority_records = sum(n_g, na.rm = TRUE),
+                          strongest_q = suppressWarnings(min(q, na.rm = TRUE))),
+                        by = lei], by = "lei", all.x = TRUE)
+    z[, per_1000 := round(1000 * loans / pmax(minority_records, 1), 1)]
+    z[, charter := c("0" = "Unknown", "1" = "Federal",
+                     "2" = "State")[as.character(cu_type)]]
+    setorder(z, -loans)
+    z[, rank := .I]
+    setcolorder(z, intersect(c("rank", "name", "charter", "loans",
+                               "per_1000", "extreme", names(z)), names(z)))
+    z[, c("lei", "cu_type", "assets_tot") := NULL]
+    scr_sum[[sc]] <- z
+    fwrite(z, out(sprintf("outlier_summary_%s_2025.csv", sc)))
+  }
   readme <- rbind(readme, data.table(
     column = c("SUMMARY: outliers_per_1000", "SUMMARY: extreme_cases",
                "SUMMARY: contradicted_reasons", "SUMMARY: excess_dollars_yr",
@@ -706,7 +795,10 @@ if (have_ox2 || have_openxlsx || have_writexl) {
       "Denials where the CU's stated reason is contradicted by its OWN approved white borrowers",
       "Pricing rows: total excess interest per year + excess fees, in dollars",
       "The single most significant statistical result at this CU (smaller = stronger evidence)")))
-  sheets <- list(ReadMe = readme, Summary = smy)
+  sheets <- list(ReadMe = readme, Summary = smy,
+                 `Summary Denial` = scr_sum[["denial"]],
+                 `Summary Withdrawal` = scr_sum[["withdrawal"]],
+                 `Summary Pricing` = scr_sum[["pricing"]])
   for (st in names(all_streams))
     for (sc in sheet_screens) {
       nmx <- tools::toTitleCase(paste(st, sc))
