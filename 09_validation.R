@@ -103,11 +103,21 @@ cat(sprintf("  -> under permuted labels the screen flags %.1f%% of the real coun
 # ---- 2. INJECTION POWER --------------------------------------------------------------
 cat("\n== 2. INJECTION POWER (denial screen) ==\n")
 den <- res0$denial
-elig <- den[group != "white", .N, by = .(lei, group)][N >= 30]
+# inject ONLY into cells the screen actually tests under CURRENT settings:
+# the baseline flags table lists every tested cell, so eligibility derived
+# from it automatically respects min_group / top_n as configured
+elig <- real_flags[screen == "denial" & group != "white",
+                   .(lei, group, N = n_g)]
+elig <- unique(elig)[N >= 30]
+if (!nrow(elig)) stop("No testable denial cells in baseline -- cannot run",
+                      " the injection study.", call. = FALSE)
 grid <- CJ(gap = inject_gaps, rep = seq_len(inject_cells))
 pw <- list()
+setorder(elig, -N)
 for (g in inject_gaps) {
-  tgt <- elig[sample(.N, min(inject_cells, .N))]
+  # largest testable cells: upper-bound power (small-cell power is bounded
+  # by the materiality gate by design -- see NOTE below)
+  tgt <- elig[seq_len(min(inject_cells, .N))]
   res_i <- lapply(res0, copy)
   res_i$denial <- copy(den)
   for (k in seq_len(nrow(tgt)))
