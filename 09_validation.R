@@ -93,6 +93,10 @@ for (b in seq_len(B_placebo)) {
 }
 cat(sprintf("PLACEBO RESULT: mean %.1f flags (max %d) vs %d on real labels\n",
             mean(plac), max(plac), n_real))
+fwrite(data.table(metric = c("real_flags", "placebo_mean", "placebo_max",
+                             "placebo_reps"),
+                  value = c(n_real, mean(plac), max(plac), B_placebo)),
+       out("validation_placebo_2025.csv"))
 cat(sprintf("  -> under permuted labels the screen flags %.1f%% of the real count\n",
             100 * mean(plac) / max(n_real, 1)))
 
