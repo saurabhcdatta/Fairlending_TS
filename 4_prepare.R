@@ -169,6 +169,18 @@ wf <- data.table(step = "raw CU applications", rows = n0)
 dat <- dat[!is.na(group)];    .wf("known race/ethnicity")
 dat <- dat[sex %in% 1:2];     .wf("sex reported F/M")
 dat <- dat[loan_amount > 0];  .wf("positive loan amount")
+# non-federally insured CUs (cu_type 3) are outside NCUA exam jurisdiction --
+# drop their applications from the ANALYSIS entirely (models, screens,
+# rankings). The assets file keeps recording them for provenance; this is
+# the ONE place the restriction is applied.
+.af <- out("cu_assets_2025.csv")
+if (!file.exists(.af))
+  stop("cu_assets_2025.csv not found -- run 2_assets.R before 4_prepare.R ",
+       "(needed to drop non-federally insured cu_type-3 institutions).",
+       call. = FALSE)
+.t3_lei <- fread(.af, colClasses = list(character = "lei"))[cu_type == 3L, lei]
+dat <- dat[!lei %in% .t3_lei]
+.wf(sprintf("drop non-fed-insured (type 3: %d CUs)", length(.t3_lei)))
 
 # credit score: max of valid applicant/co-applicant scores (SAS rule)
 .okcs <- function(x) !is.na(x) & x > 300 & x < 900

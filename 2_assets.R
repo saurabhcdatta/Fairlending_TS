@@ -114,8 +114,15 @@ cat("Asset deciles ($B):\n")
 print(round(quantile(cu_d$assets_tot, probs = seq(0, 1, .1)) / 1e9, 3))
 .chk(!anyDuplicated(cu_d$lei),                    "one row per LEI")
 .chk(cu_d[, all(assets_tot > 0)],                 "assets all positive")
-.chk(cu_d[, all(cu_type %in% c(0L, 1L, 2L), na.rm = TRUE)],
-     "cu_type only 0/1/2 (unknown/federal/state)")
+.chk(cu_d[, all(cu_type %in% c(0L, 1L, 2L, 3L), na.rm = TRUE)],
+     "cu_type only 0/1/2/3 (unknown / fed-insured FCU / fed-insured state / non-fed-insured)")
+if (cu_d[, any(cu_type == 3L, na.rm = TRUE)])
+  cat(sprintf(paste0("  NOTE: %d CUs with cu_type = 3 (non-federally insured,",
+                     " $%.1fB) -- outside NCUA exam\n  jurisdiction;",
+                     " 6_screen.R excludes them by default (screen_types",
+                     " knob to include).\n"),
+              cu_d[cu_type == 3L, .N],
+              cu_d[cu_type == 3L, sum(assets_tot)] / 1e9))
 .chk(cu_d[, mean(cu_type %in% 1:2)] > 0.5,
      "cu_type populated for most CUs (else the OCE pull is stale)")
-cat("(real-2025 reference: ~4-5k credit unions in the crosswalked universe)\n")
+cat("(real-2025 reference: ~1.7k HMDA-reporting CUs in the crosswalked universe)\n")

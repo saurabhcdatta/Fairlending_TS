@@ -46,6 +46,11 @@ fdr_watch  <- 0.10        # ...for the watch tier
 floors     <- c(denial = 0.02, withdrawal = 0.03, pricing = 0.10)
 p_mat_high <- 0.90        # posterior P(gap >= floor) needed for high
 p_mat_flag <- 0.50        # ...for flag / watch materiality
+screen_types <- c(1L, 2L)  # cu_types in the SCREENING universe. Type-3
+                           # (non-federally insured) applications are already
+                           # dropped from the analysis in 4_prepare; this
+                           # knob is defense-in-depth so the screen can never
+                           # reintroduce them via the assets universe.
 top_n      <- 200         # screen the largest N CUs by assets PER cu_type
                           # (1 = federal insured, 2 = state insured;
                           #  screening, peer nulls, shrinkage, BH and tiers
@@ -64,6 +69,11 @@ if (!"cu_type" %in% names(assets)) assets[, cu_type := NA_integer_]
 assets[is.na(cu_type), cu_type := 0L]        # unknown type screened together
 if (!is.finite(top_n)) top_n <- .Machine$integer.max  # top_n <- Inf =
                                                        # screen EVERY CU
+n_excl <- assets[!cu_type %in% screen_types, .N]
+if (n_excl) cat(sprintf(
+  "screening universe: excluding %d CUs with cu_type outside {%s}\n",
+  n_excl, paste(screen_types, collapse = ", ")))
+assets <- assets[cu_type %in% screen_types]
 top_uni <- assets[order(-assets_tot), head(.SD, top_n), by = cu_type]
 assets[, peer := cu_type]         # peers = same charter type (cluster peers
                                   # return with the unsupervised track later)

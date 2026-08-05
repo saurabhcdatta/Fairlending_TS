@@ -98,7 +98,8 @@ tryCatch({
 oce_df <- data.frame(join_number = rep(1:30, 2),
                      CU_Name = sprintf("TEST CU %02d", rep(1:30, 2)),
                      Assets_Tot = rep(seq(3e9, 1e8, length.out = 30), 2),
-                     CU_Type = rep(ifelse(1:30 %% 3 == 0, 2L, 1L), 2),
+                     CU_Type = rep(ifelse(1:30 %in% 28:29, 3L,      # 2 non-fed-insured
+                                   ifelse(1:30 %% 3 == 0, 2L, 1L)), 2),
                      q_period_num = rep(c(2025.4, 2024.4), each = 30))
 # CU12 (pricing plant) -> cu_type 2 (12 %% 3 == 0); CU07 (denial) -> type 1
 haven::write_dta(oce_df, "/tmp/fake_share/oce.dta")
@@ -221,6 +222,10 @@ stopifnot(all(!is.na(a$pmms)),
           mean(a$jumbo[a$fips %in% sprintf("%05d", 11:12)]) >
             mean(a$jumbo[!a$fips %in% sprintf("%05d", 11:12)]))
 cat("reference joins verified: pmms / jumbo / msa\n")
+# cu_type-3 CUs (LEI28/LEI29) must be gone from the ANALYSIS and the screen
+stopifnot(!any(a$lei %in% c("LEI28", "LEI29")),
+          !any(flags$lei %in% c("LEI28", "LEI29")))
+cat("non-federally insured (type 3) dropped from analysis + screen: OK\n")
 stopifnot(all(!is.na(flags$name)),
           flags[lei == "LEI07" & screen == "denial" & group == "black",
                 name] == "TEST CU 07")
