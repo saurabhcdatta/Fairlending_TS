@@ -17,7 +17,12 @@ script and below). Scripts still run whole via source() in order 1..7.
 ## Setup
 
 Paths live in `0_settings.R` -- part of the numbered chain, not a
-separate config file. Edit the four paths, run it once at the start of
+separate config file. The optional `prior_work_dir` there points at a
+folder from an earlier successful run (e.g. the production out/2025):
+1_reference.R then reuses its reference files and staged downloads
+instead of hitting FRED/FHFA/Census, which the agency network often
+blocks, and its diagnostics verify what was copied (including that the
+PMMS file actually covers the 2025 action dates). Edit the four paths, run it once at the start of
 the session; it defines the paths and `out()` in your environment and
 reports which input files it can see. Scripts 1-8 use those values
 directly and auto-source 0_settings.R only if you forgot to run it

@@ -12,6 +12,12 @@ oce_file   <- "EDIT-ME"   # OCE combined .dta (quarterly pull)
 xwalk_file <- "EDIT-ME"   # HMDA-CU crosswalk .dta (join_number -> LEI)
 work_dir   <- "EDIT-ME"   # out/<year> folder for THIS vintage; never mix years
 
+# OPTIONAL: a folder from an EARLIER successful run (e.g. the production
+# out/2025). 1_reference.R reuses its reference files instead of downloading
+# (the FRED/FHFA/Census pulls are often blocked on the agency network).
+# Leave "" to build fresh.
+prior_work_dir <- ""
+
 if (any(c(raw_dta, oce_file, xwalk_file, work_dir) == "EDIT-ME"))
   stop("0_settings.R still has EDIT-ME placeholders.\n",
        "  Edit the four paths at the top, run this script, then continue.",

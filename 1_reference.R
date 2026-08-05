@@ -113,6 +113,42 @@ if (!exists("out")) source("0_settings.R")   # paths: run/edit 0_settings.R firs
   unique(out[!is.na(cbsa) & cbsa != ""], by = "fips")
 }
 
+# ---- BLOCK 0b: REUSE a prior run's reference files ---------------------------
+# Downloads are often blocked on the agency network. If 0_settings.R sets
+# prior_work_dir to a folder where an earlier run already built these files,
+# copy them (and any staged raw downloads) into THIS work_dir first; the
+# builders below then take their "already present" fast path, and the
+# DIAGNOSTICS block at the end verifies what was copied.
+.reusable <- c("pmms_weekly.csv", "jumbo_2025.csv", "msa_crosswalk.csv",
+               # staged raw downloads are reusable too (normalized below):
+               "raw_pmms.csv", "fredgraph.csv", "MORTGAGE30US.csv",
+               "raw_fhfa_2025.csv",
+               "fullcountyloanlimitlist2025_hera-based_final_flat.csv",
+               "raw_msa.csv", "cbsa2fipsxw_2023.csv", "cbsa2fipsxw.csv",
+               "list1_2023.csv")
+if (exists("prior_work_dir") && is.character(prior_work_dir) &&
+    nzchar(prior_work_dir)) {
+  if (!dir.exists(prior_work_dir)) {
+    cat("!! prior_work_dir set but not found:", prior_work_dir,
+        "-- building fresh instead
+")
+  } else {
+    n_reused <- 0L
+    for (rf in .reusable) {
+      src <- file.path(prior_work_dir, rf)
+      if (!file.exists(out(rf)) && file.exists(src)) {
+        file.copy(src, out(rf)); n_reused <- n_reused + 1L
+        cat("  reused from prior run:", rf, "
+")
+      }
+    }
+    if (n_reused == 0L)
+      cat("  nothing to reuse in", prior_work_dir,
+          "(files already present here, or none built there)
+")
+  }
+}
+
 # raw_names: staged filenames accepted, FIRST FOUND WINS -- includes the
 # browser's original download name, so no renaming is ever needed.
 # alt: optional function returning the FINAL normalized table (Census API).
@@ -142,7 +178,9 @@ if (!exists("out")) source("0_settings.R")   # paths: run/edit 0_settings.R firs
     stop(final, ": download blocked. In your BROWSER open\n  ", url,
          "\nsave it into  ", work_dir, "  (its own name ",
          basename(url), " is fine, or ", raw_names[1], ")",
-         "\nthen rerun 00_reference.R (it will normalize it).", call. = FALSE)
+         "\nthen rerun 1_reference.R (it will normalize it) -- or set\n",
+         "prior_work_dir in 0_settings.R to reuse an earlier run's files.",
+         call. = FALSE)
   fwrite(normalize(reader(src)), out(final))
 }
 
@@ -220,6 +258,9 @@ cat(sprintf("PMMS: %s weekly rows | %s .. %s | rate range %.2f-%.2f\n",
             max(pmms_d$date), min(pmms_d$pmms), max(pmms_d$pmms)))
 .chk(pmms_d[, all(pmms > 1 & pmms < 12)], "PMMS rates inside 1-12% (units are %, not bp)")
 .chk(pmms_d[, !anyNA(date)],              "PMMS dates all parse")
+.chk(min(pmms_d$date) <= as.Date("2025-01-07") &
+     max(pmms_d$date) >= as.Date("2025-12-01"),
+     "PMMS coverage spans the 2025 action dates (stale prior-year file?)")
 cat(sprintf("FHFA limits: %s counties | baseline-limit share %.0f%%\n",
             format(nrow(jmb_d), big.mark = ","),
             100 * jmb_d[, mean(one_unit_limit == min(one_unit_limit))]))
