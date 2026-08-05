@@ -152,10 +152,29 @@ if (exists("prior_work_dir") && is.character(prior_work_dir) &&
 # raw_names: staged filenames accepted, FIRST FOUND WINS -- includes the
 # browser's original download name, so no renaming is ever needed.
 # alt: optional function returning the FINAL normalized table (Census API).
+# want: the columns the FINAL normalized file must have. If a file with the
+# final name exists but has different columns, it is almost always a RAW
+# browser download saved under the final name (which would silently skip
+# normalization) -- rename it to a staged name and normalize it instead.
 .build <- function(final, raw_names, url, normalize, reader = fread,
-                   alt = NULL) {
+                   alt = NULL, want) {
   if (file.exists(out(final))) {
-    cat(final, "already present\n"); return(invisible())
+    have <- names(fread(out(final), nrows = 0))
+    if (all(want %in% have)) {
+      cat(final, "already present\n"); return(invisible())
+    }
+    free <- raw_names[!file.exists(out(raw_names))][1]
+    if (is.na(free))
+      stop(final, " has columns [", paste(have, collapse = ", "),
+           "], expected [", paste(want, collapse = ", "), "] -- it looks",
+           " like a raw download saved under the final name, but every",
+           " staged name is taken. Tidy the folder (keep ONE raw copy as ",
+           raw_names[1], ", delete ", final, ") and rerun.", call. = FALSE)
+    cat(final, "exists but has columns [", paste(have, collapse = ", "),
+        "] instead of [", paste(want, collapse = ", "), "] --\n  treating",
+        "it as a RAW download saved under the final name; renaming it to",
+        free, "and normalizing it now.\n")
+    file.rename(out(final), out(free))
   }
   staged <- raw_names[file.exists(out(raw_names))][1]
   src <- if (!is.na(staged)) {
@@ -191,7 +210,7 @@ if (exists("prior_work_dir") && is.character(prior_work_dir) &&
          setnames(p, 1:2, c("date", "pmms"))   # by position; header names vary
          p <- p[!is.na(suppressWarnings(as.numeric(pmms)))]
          p[, .(date = as.Date(date), pmms = as.numeric(pmms))]
-       })
+       }, want = c("date", "pmms"))
 
 # --- 2. FHFA conforming limits, 2025 ----------------------------------------------
 .build("jumbo_2025.csv",
@@ -205,7 +224,7 @@ if (exists("prior_work_dir") && is.character(prior_work_dir) &&
          unique(data.table(fips = .fips(j[[st]], j[[co]]),
                            one_unit_limit = as.numeric(gsub("[$,]", "",
                                                             j[[lm]]))))
-       })
+       }, want = c("fips", "one_unit_limit"))
 
 # --- 3. MSA crosswalk ---------------------------------------------------------------
 # Current NBER location (files moved into a /2023/ subfolder, May 2026 update):
@@ -239,7 +258,7 @@ if (exists("prior_work_dir") && is.character(prior_work_dir) &&
          unique(d[!is.na(cbsa) & cbsa != ""], by = "fips")
        },
        reader = .read_msa_csv,
-       alt = .census_api_msa)
+       alt = .census_api_msa, want = c("fips", "cbsa", "metro"))
 
 # --- 4. show what landed --------------------------------------------------------------
 for (rf in c("pmms_weekly.csv", "jumbo_2025.csv", "msa_crosswalk.csv")) {
