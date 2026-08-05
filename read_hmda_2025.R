@@ -24,7 +24,12 @@ dta_path <- "//hqwinfs1/economist/Projects/HMDA/Agency Data/2025/HMDA_05_31_2026
 stopifnot(file.exists(dta_path))
 
 # --- 1. names + types from the binary header (always works, seconds) -----------
-source("tools/dta_header.R")
+if (file.exists("tools/dta_header.R")) {
+  source("tools/dta_header.R")
+} else {
+  source("dta_header.R")
+}
+
 
 info <- dta_header(dta_path)
 cat(sprintf("File: %d columns x %s rows (format %d)\n", nrow(info),

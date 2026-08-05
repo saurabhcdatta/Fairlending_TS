@@ -45,6 +45,7 @@ source("settings.R")
 # ------------------------------- FILTERS (edit here) --------------------------
 min_group  <- 20          # minority applications needed at the CU to test
 min_white  <- 50          # white applications needed to compare against
+if (!exists("stream_tag"))               # wrappers may pre-set this
 stream_tag <- "popick"    # which residual stream produced the input:
                           # "popick" (03a) | "ml" (03b). A tagged copy
                           # flags_<stream>_2025.csv is written for 07.
@@ -68,7 +69,16 @@ seed       <- 20250101
 # ------------------------------------------------------------------------------
 
 set.seed(seed)
-res <- readRDS(out("residuals_2025.rds"))
+res_file <- if (stream_tag == "ml" &&
+                file.exists(out("residuals_ml_2025.rds"))) {
+  out("residuals_ml_2025.rds")
+} else if (stream_tag == "popick" &&
+           file.exists(out("residuals_econ_2025.rds"))) {
+  out("residuals_econ_2025.rds")
+} else out("residuals_2025.rds")
+cat(sprintf("[stream %s] screening residuals: %s\n", stream_tag,
+            basename(res_file)))
+res <- readRDS(res_file)
 
 af <- out("cu_assets_2025.csv")
 if (!file.exists(af))
@@ -76,6 +86,8 @@ if (!file.exists(af))
 assets  <- fread(af, colClasses = list(character = "lei"))
 if (!"cu_type" %in% names(assets)) assets[, cu_type := NA_integer_]
 assets[is.na(cu_type), cu_type := 0L]        # unknown type screened together
+if (!is.finite(top_n)) top_n <- .Machine$integer.max  # top_n <- Inf =
+                                                       # screen EVERY CU
 top_uni <- assets[order(-assets_tot), head(.SD, top_n), by = cu_type]
 assets[, peer := cu_type]
 if (peer_group == "cluster" && file.exists(out("peer_clusters_2025.csv"))) {

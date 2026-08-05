@@ -20,10 +20,16 @@
 
 library(data.table)
 
+cat("== 06_rank_outliers.R VERSION 2026-07-15a",
+    "(multi-tab workbook + Summary + rebuttal w/ model context) ==\n")
+
 source("settings.R")
 
 # ------------------------------- FILTERS (edit here) --------------------------
-stream_tag        <- "popick"        # tagged copies *_<stream>_2025.csv for 07
+if (!exists("workbook_only")) workbook_only <- FALSE  # 07 sets TRUE to
+                                     # rebuild tabs from disk, no mining
+if (!exists("stream_tag"))           # wrappers 06a/06b pre-set this
+  stream_tag      <- "popick"        # tagged copies *_<stream>_2025.csv for 07
 flag_source       <- c("v2", "sas")  # "v2" tiers, "sas" legacy, "steering"
 # LOAN SELECTION -- EXCESS-CALIBRATED (the scientific rule):
 #   Each flagged cell's posterior gap estimates the NUMBER of adverse
@@ -43,8 +49,26 @@ fallback_share     <- 0.10  # top decile for cells lacking eb_gap
 max_per_cell       <- 1000  # hard cap per cell (file-size guard)
 # ------------------------------------------------------------------------------
 
-res   <- readRDS(out("residuals_2025.rds"))
-flags <- fread(out("flags_2025.csv"), colClasses = list(character = "lei"))
+if (!workbook_only) {
+# STREAM-CONSISTENT INPUTS: each stream mines ITS OWN residuals and ITS OWN
+# flags -- never whichever file happened to be written last.
+res_file <- if (stream_tag == "ml" &&
+                file.exists(out("residuals_ml_2025.rds"))) {
+  out("residuals_ml_2025.rds")
+} else if (stream_tag == "popick" &&
+           file.exists(out("residuals_econ_2025.rds"))) {
+  out("residuals_econ_2025.rds")     # econ backup after 03b's swap
+} else out("residuals_2025.rds")
+flags_file <- if (file.exists(out(sprintf("flags_%s_2025.csv", stream_tag)))) {
+  out(sprintf("flags_%s_2025.csv", stream_tag))
+} else out("flags_2025.csv")
+cat(sprintf("[stream %s] residuals: %s | flags: %s\n", stream_tag,
+            basename(res_file), basename(flags_file)))
+if (!grepl(stream_tag, flags_file))
+  cat("  NOTE: stream-tagged flags not found; using flags_2025.csv --",
+      "run 04a with this stream_tag first for strict separation.\n")
+res   <- readRDS(res_file)
+flags <- fread(flags_file, colClasses = list(character = "lei"))
 dat   <- readRDS(out("analysis_2025.rds"))
 
 # cells to mine: v2 flags are CU x group x screen; SAS anomalies are CU x
@@ -327,8 +351,11 @@ if (file.exists(cf_file)) {
                                                "supporting factor"))]
   lv[, plain_w := sprintf("%s (%s)", plain, weight)]
   good <- lv[estimate < 0][order(estimate),
-             .(outlier_reason = paste(head(lbl, 3), collapse = "; "),
-               reason_plain   = paste(head(plain_w, 3), collapse = "; ")),
+             .(outlier_reason = paste(head(lbl, 4), collapse = "; "),
+               reason_plain   = paste(sprintf("%d) %s",
+                                              seq_len(min(.N, 4)),
+                                              head(plain_w, 4)),
+                                      collapse = "; ")),
              by = uli]
   bad  <- lv[estimate > 0.05][order(-estimate),
              .(risk_factors_present = paste(head(lbl, 2), collapse = "; "),
@@ -339,14 +366,8 @@ if (file.exists(cf_file)) {
   for (cc in c("outlier_reason", "reason_plain", "risk_factors_present",
                "risk_plain"))
     if (cc %in% names(loans)) loans[is.na(get(cc)), (cc) := ""]
-  # lead-in by screen so the sentence reads on its own
-  .lead <- c(denial = "Approval was expected mainly because of: ",
-             withdrawal = "Completion was expected mainly because of: ",
-             pricing = "A lower rate was expected mainly because of: ")
-  loans[nzchar(reason_plain),
-        reason_plain := paste0(.lead[screen], reason_plain)]
-  loans[nzchar(risk_plain),
-        risk_plain := paste0("Working the other way: ", risk_plain)]
+  # (kept compact: factors are ranked 1) 2) 3) 4); the ReadMe sheet
+  #  explains that these are the reasons the model expected a good outcome)
   loans[, mkey := NULL]
   cat("Per-loan reasons attached from model coefficients",
       "(top approval-pointing factors + any risk factors).
@@ -354,8 +375,213 @@ if (file.exists(cf_file)) {
 } else cat("(model_coefficients_2025.csv not found -- rerun 03a for",
            "per-loan reasons)
 ")
+# ---- MATCHED COMPARATOR: the classic examination exhibit ----------------------
+# For every outlier, the closest-profile WHITE loan at the SAME CU and SAME
+# product with the GOOD outcome: approved (denial), completed (withdrawal),
+# or priced at/below model expectation (pricing). Match is algorithmic
+# (nearest neighbor on standardized score/DTI/CLTV/amount/income), distance
+# reported, and weaker_profile_comparator = 1 marks the strongest exhibits:
+# the comparator's profile is no better on ANY matched dimension.
+set.seed(20250101)
+dat[, `:=`(.la = log(pmax(loan_amount, 1)), .li = log(pmax(income, 1)))]
+mfeat <- c("credit_score", "dti", "ltv_combined", ".la", ".li")
+pools <- list(
+  denial     = dat[in_denial_universe == TRUE & group == "white" &
+                   denied == 0],
+  withdrawal = dat[in_withdrawal_universe == TRUE & group == "white" &
+                   withdrawn == 0],
+  pricing    = {
+    pw <- res$pricing[!is.na(resid_price) & resid_price <= 0 &
+                      group == "white", .(uli)]
+    dat[uli %in% pw$uli]
+  })
+comp_rows <- list()
+for (sc in intersect(names(pools), unique(loans$screen))) {
+  ol <- loans[screen == sc]
+  po <- pools[[sc]]
+  if (!nrow(ol) || !nrow(po)) next
+  for (key in unique(ol[, paste(lei, loan_cat)])) {
+    oo <- ol[paste(lei, loan_cat) == key]
+    pp <- po[paste(lei, loan_cat) == key]
+    if (!nrow(pp)) next
+    if (nrow(pp) > 5000) pp <- pp[sample(.N, 5000)]
+    mu <- pp[, lapply(.SD, mean, na.rm = TRUE), .SDcols = mfeat]
+    sg <- pp[, lapply(.SD, function(z) pmax(sd(z, na.rm = TRUE), 1e-6)),
+             .SDcols = mfeat]
+    Z  <- as.matrix(pp[, ..mfeat]); O <- as.matrix(oo[, .(credit_score, dti,
+                    ltv_combined, .la = log(pmax(loan_amount, 1)),
+                    .li = log(pmax(income, 1)))])
+    for (j in seq_along(mfeat)) {
+      Z[, j] <- (Z[, j] - mu[[j]]) / sg[[j]]
+      O[, j] <- (O[, j] - mu[[j]]) / sg[[j]]
+    }
+    Z[is.na(Z)] <- 0; O[is.na(O)] <- 0
+    for (i in seq_len(nrow(oo))) {
+      dist2 <- colSums((t(Z) - O[i, ])^2)
+      b <- which.min(dist2)
+      weaker <- as.integer(
+        (is.na(pp$credit_score[b]) | is.na(oo$credit_score[i]) |
+           pp$credit_score[b] <= oo$credit_score[i]) &
+        (is.na(pp$dti[b]) | is.na(oo$dti[i]) | pp$dti[b] >= oo$dti[i]) &
+        (is.na(pp$ltv_combined[b]) | is.na(oo$ltv_combined[i]) |
+           pp$ltv_combined[b] >= oo$ltv_combined[i]))
+      comp_rows[[length(comp_rows) + 1L]] <- data.table(
+        uli = oo$uli[i], comp_uli = pp$uli[b],
+        comp_credit_score = pp$credit_score[b], comp_dti = pp$dti[b],
+        comp_ltv = pp$ltv_combined[b], comp_loan_amount = pp$loan_amount[b],
+        comp_interest_rate = pp$interest_rate[b],
+        comp_outcome = c(denial = "approved", withdrawal = "completed",
+                         pricing = "priced at/below expectation")[[sc]],
+        match_distance = round(sqrt(dist2[b]), 3),
+        weaker_profile_comparator = weaker)
+    }
+  }
+}
+# benchmarks for the REBUTTAL column: this CU's typical APPROVED white
+# borrower, per product (median score / DTI / CLTV)
+wbench <- pools$denial[, .(med_cs = median(credit_score, na.rm = TRUE),
+                           med_dti = median(dti, na.rm = TRUE),
+                           med_ltv = median(ltv_combined, na.rm = TRUE)),
+                       by = .(lei, loan_cat)]
+if (length(comp_rows)) {
+  loans <- merge(loans, rbindlist(comp_rows), by = "uli", all.x = TRUE)
+  cat(sprintf("Matched white comparators attached: %s of %s outliers (%s with equal-or-weaker profiles)\n",
+      format(sum(!is.na(loans$comp_uli)), big.mark = ","),
+      format(nrow(loans), big.mark = ","),
+      format(sum(loans$weaker_profile_comparator %in% 1L), big.mark = ",")))
+}
 loans <- merge(loans, assets[, .(lei, name)], by = "lei", all.x = TRUE)
+# ---- REBUTTAL: test the institution's stated reason against its own data ------
+# For each denied outlier with a stated HMDA reason, compare the applicant's
+# relevant metric to (a) this CU's median APPROVED white borrower and (b)
+# the matched approved comparator. When the applicant is STRONGER than
+# both, the stated reason is contradicted by the institution's own lending
+# record. Reasons HMDA cannot observe (cash, employment, verification,
+# completeness) are labeled not testable -- honesty preserves credibility.
+loans <- merge(loans, wbench, by = c("lei", "loan_cat"), all.x = TRUE)
+.reb <- function(reason, cs, dti, ltv, ccs, cdti, cltv, mcs, mdti, mltv,
+                 me, factor1, weaker) {
+  ctx <- sprintf("Model context: %.1f%% predicted denial odds%s%s",
+                 100 * me,
+                 if (nzchar(factor1)) paste0("; top strength: ", factor1)
+                 else "",
+                 if (!is.na(weaker) && weaker == 1L)
+                   "; white comparator APPROVED with equal-or-weaker profile"
+                 else if (!is.na(ccs))
+                   "; closest white comparator approved" else "")
+  if (is.na(reason) || reason == 10)
+    return(paste("NO SPECIFIC REASON REPORTED -- Reg B requires specific",
+                 "adverse-action reasons.", ctx))
+  if (reason == 9)
+    return(paste("Stated reason 'other' (unspecific).", ctx))
+  if (reason == 3) {          # credit history: higher score = stronger
+    if (is.na(cs) || is.na(mcs)) return("stated reason: credit history (score unavailable)")
+    tag <- if (!is.na(ccs) && cs >= mcs && cs >= ccs) "CONTRADICTED" else
+           if (cs >= mcs) "QUESTIONABLE" else "consistent with data"
+    sprintf("%s -- cited credit history, but applicant score %d vs CU's median APPROVED white score %d%s",
+            tag, as.integer(cs), as.integer(mcs),
+            if (!is.na(ccs)) sprintf(" and approved comparator %d",
+                                     as.integer(ccs)) else "")
+  } else if (reason == 1) {   # DTI: lower = stronger
+    if (is.na(dti) || is.na(mdti)) return("stated reason: DTI (value unavailable)")
+    tag <- if (!is.na(cdti) && dti <= mdti && dti <= cdti) "CONTRADICTED" else
+           if (dti <= mdti) "QUESTIONABLE" else "consistent with data"
+    sprintf("%s -- cited debt-to-income, but applicant DTI %.1f vs CU's median APPROVED white DTI %.1f%s",
+            tag, dti, mdti,
+            if (!is.na(cdti)) sprintf(" and approved comparator %.1f", cdti)
+            else "")
+  } else if (reason == 4) {   # collateral: lower CLTV = stronger
+    if (is.na(ltv) || is.na(mltv)) return("stated reason: collateral (CLTV unavailable)")
+    tag <- if (!is.na(cltv) && ltv <= mltv && ltv <= cltv) "CONTRADICTED" else
+           if (ltv <= mltv) "QUESTIONABLE" else "consistent with data"
+    sprintf("%s -- cited collateral, but applicant CLTV %.0f vs CU's median APPROVED white CLTV %.0f%s",
+            tag, ltv, mltv,
+            if (!is.na(cltv)) sprintf(" and approved comparator %.0f", cltv)
+            else "")
+  } else paste0("Stated reason (",
+                c("1" = "DTI", "2" = "employment history",
+                  "3" = "credit history", "4" = "collateral",
+                  "5" = "insufficient cash", "6" = "unverifiable info",
+                  "7" = "application incomplete",
+                  "8" = "mortgage insurance denied")[as.character(reason)],
+                ") not directly testable in HMDA. ", ctx)
+}
+if ("denial_reason1" %in% names(loans)) {
+  loans[screen == "denial",
+        rebuttal_evidence := mapply(.reb, denial_reason1, credit_score, dti,
+                                    ltv_combined, comp_credit_score,
+                                    comp_dti, comp_ltv, med_cs, med_dti,
+                                    med_ltv, model_expected,
+                                    fifelse(nzchar(reason_plain),
+                                      sub(";.*$", "",
+                                          sub("^1\\) ", "", reason_plain)),
+                                      ""),
+                                    weaker_profile_comparator)]
+  loans[is.na(rebuttal_evidence), rebuttal_evidence := ""]
+  cat(sprintf("Rebuttal evidence: %d stated reasons CONTRADICTED by the CU's own approvals\n",
+              loans[grepl("^CONTRADICTED", rebuttal_evidence), .N]))
+}
+loans[, c("med_cs", "med_dti", "med_ltv") := NULL]
+# ---- examiner-first columns ----------------------------------------------------
+loans[, what_happened := fifelse(screen == "denial",
+    sprintf("DENIED despite %.1f%% predicted denial risk",
+            100 * (1 - resid)),
+  fifelse(screen == "withdrawal",
+    sprintf("WITHDREW despite %.1f%% predicted withdrawal risk",
+            100 * (1 - resid)),
+  fifelse(screen == "pricing",
+    sprintf("Paid %.3f%% vs %.3f%% expected (+%.0f bp)",
+            interest_rate, model_expected_rate, 100 * resid),
+    "Placed in high-cost product tier despite prime-eligible profile")))]
+loans[, surprise_level := fifelse(screen %in% c("denial", "withdrawal"),
+    fcase(1 - resid <= 0.05, "EXTREME (<=5% expected)",
+          1 - resid <= 0.15, "HIGH (<=15% expected)",
+          default = "MODERATE"),
+    fcase(resid >= 0.50, "EXTREME (50+ bp excess)",
+          resid >= 0.25, "HIGH (25+ bp excess)",
+          default = "MODERATE"))]
+loans[screen == "pricing",
+      excess_rate_dollars_yr := round(resid / 100 * loan_amount)]
+loans[screen == "pricing" & !is.na(excess_other_costs_pct),
+      excess_fees_dollars := round(excess_other_costs_pct / 100 * loan_amount)]
+loans[, review_priority := frank(-resid, ties.method = "first"),
+      by = .(lei, screen)]
+# pricing: "not applicable" is CORRECT HMDA reporting for an origination --
+# the case is PRICE, so the rebuttal argues in the loan's own numbers
+loans[screen == "pricing",
+      rebuttal_evidence := sprintf(
+        paste0("PRICE CASE (originated, so no denial reason applies): paid ",
+               "%.3f%% vs %.3f%% model-expected (+%.0f bp = $%s/yr excess",
+               "%s)%s"),
+        interest_rate, model_expected_rate, 100 * resid,
+        format(excess_rate_dollars_yr, big.mark = ","),
+        fifelse(!is.na(excess_fees_dollars) & excess_fees_dollars > 0,
+                sprintf(" + $%s excess fees",
+                        format(excess_fees_dollars, big.mark = ",")), ""),
+        fifelse(!is.na(comp_interest_rate),
+                sprintf("; matched white borrower at this CU paid %.3f%%",
+                        comp_interest_rate), ""))]
+loans[screen == "withdrawal",
+      rebuttal_evidence := sprintf(
+        paste0("WITHDRAWAL CASE (HMDA collects no institution reason): ",
+               "model gave %.1f%% withdrawal odds; review question is ",
+               "processing -- quote timeliness, follow-up, rate honored%s"),
+        100 * (1 - resid),
+        fifelse(!is.na(comp_uli),
+                "; comparable white applicant at this CU completed", ""))]
+
 setorder(loans, screen, -resid)
+# (2) comparator variables NEXT TO their outlier counterparts
+.pairs <- c("name", "screen", "loan_cat", "group", "uli", "review_priority",
+            "what_happened", "surprise_level",
+            "credit_score", "comp_credit_score", "dti", "comp_dti",
+            "ltv_combined", "comp_ltv", "loan_amount", "comp_loan_amount",
+            "interest_rate", "comp_interest_rate", "model_expected",
+            "model_expected_rate", "excess_rate_dollars_yr",
+            "excess_fees_dollars", "comp_outcome", "match_distance",
+            "weaker_profile_comparator", "reason_plain", "risk_plain",
+            "cu_stated_reason", "rebuttal_evidence")
+setcolorder(loans, intersect(.pairs, names(loans)))
 setcolorder(loans, c("name", "lei", "screen", "loan_cat", "group", "uli",
                      "resid"))
 fwrite(loans, out("outlier_loans_2025.csv"))
@@ -368,7 +594,24 @@ sheet_screens <- union(c("denial", "withdrawal", "pricing"),
 for (sc in sheet_screens)
   fwrite(loans[screen == sc],
          out(sprintf("outlier_loans_%s_sheet_2025.csv", sc)))
-if (requireNamespace("writexl", quietly = TRUE)) {
+} else {
+  cat("[06] WORKBOOK-ONLY refresh: assembling tabs from stream files\n")
+  assets <- fread(out("cu_assets_2025.csv"),
+                  colClasses = list(character = "lei"))
+  if (!"cu_type" %in% names(assets)) assets[, cu_type := 0L]
+  assets[is.na(cu_type), cu_type := 0L]
+  flags <- if (file.exists(out("flags_2025.csv"))) {
+    fread(out("flags_2025.csv"), colClasses = list(character = "lei"))
+  } else data.table(lei = character(), screen = character(),
+                    n_g = integer(), q = numeric(), tier = character())
+  stream_tag <- "__refresh__"
+  sheet_screens <- c("denial", "withdrawal", "pricing")
+}
+
+have_ox2      <- requireNamespace("openxlsx2", quietly = TRUE)
+have_openxlsx <- requireNamespace("openxlsx",  quietly = TRUE)
+have_writexl  <- requireNamespace("writexl",   quietly = TRUE)
+if (have_ox2 || have_openxlsx || have_writexl) {
   readme <- data.table(
     column = c("name", "screen", "group", "uli", "resid", "model_expected",
                "model_expected_rate", "excess_other_costs_pct",
@@ -393,16 +636,330 @@ if (requireNamespace("writexl", quietly = TRUE)) {
       "Technical version of reason_plain (model log-odds contributions)",
       "Technical version of risk_plain",
       "Which analysis stream produced this row (popick / ml)"))
-  sheets <- c(list(readme),
-              lapply(sheet_screens, function(sc) loans[screen == sc]))
-  names(sheets) <- tools::toTitleCase(c("ReadMe", sheet_screens))
-  writexl::write_xlsx(sheets, out("outlier_loans_2025.xlsx"))
-  cat("Workbook with one worksheet per screen ->",
-      out("outlier_loans_2025.xlsx"), "
-")
-} else cat("(writexl not installed -- per-screen CSVs written instead;",
-           "install.packages('writexl') for a single workbook)
-")
+  readme <- rbind(readme, data.table(
+    column = c("pair", "row_type", "comp_uli", "match_distance",
+               "weaker_profile_comparator"),
+    what_it_means = c(
+      "Links each outlier to the comparator row directly beneath it",
+      "OUTLIER = the flagged loan; '-> comparator' = the matched white loan at the same CU/product with the good outcome",
+      "Loan ID of the matched white comparator",
+      "How similar the two profiles are (0 = identical; computed on score, DTI, CLTV, amount, income)",
+      "1 = the comparator's profile was equal or WEAKER on every matched dimension -- the strongest exhibits")))
+  readme <- rbind(readme, data.table(
+    column = c("what_happened", "surprise_level", "review_priority",
+               "excess_rate_dollars_yr", "excess_fees_dollars"),
+    what_it_means = c(
+      "One-sentence summary: the outcome vs what the model predicted",
+      "How unexpected: EXTREME / HIGH / MODERATE",
+      "1 = the most unexpected loan at that credit union for that screen -- start here",
+      "Pricing: extra interest dollars PER YEAR implied by the rate excess on this loan",
+      "Pricing: extra upfront fees in dollars (points - credits + costs beyond expectation)")))
+  readme <- rbind(readme, data.table(
+    column = "rebuttal_evidence",
+    what_it_means = paste(
+      "Tests the CU's stated denial reason against its OWN approvals:",
+      "CONTRADICTED / QUESTIONABLE / consistent. Reasons HMDA cannot test",
+      "get MODEL CONTEXT (predicted denial odds, top strength, comparator",
+      "outcome). A denial with NO applicable reason is itself flagged --",
+      "Reg B requires specific adverse-action reasons")))
+  readme <- rbind(readme, data.table(
+    column = "reason_plain",
+    what_it_means = "Factors ranked 1) strongest to 4): why the model expected the GOOD outcome for this borrower"))
+  # gather ALL streams whose tagged loan files exist (this run + prior runs)
+  all_streams <- list()
+  for (st in c("popick", "ml", "ensemble")) {
+    f <- out(sprintf("outlier_loans_%s_2025.csv", st))
+    if (st == stream_tag) all_streams[[st]] <- loans
+    else if (file.exists(f)) {
+      z <- fread(f, colClasses = list(character = c("lei", "uli")))
+      # schema guard: a file from an older 06 version lacks current columns
+      # and would crash the tabs -- skip it with instructions instead
+      sentinel <- c("what_happened", "surprise_level", "reason_plain")
+      if (all(sentinel %in% names(z))) all_streams[[st]] <- z
+      else cat(sprintf(
+        "!! %s is from an OLDER 06 version (missing: %s) -- skipping its tabs.\n   Rerun 06%s to regenerate it with the current schema.\n",
+        basename(f), paste(setdiff(sentinel, names(z)), collapse = ", "),
+        if (st == "popick") "a" else "b"))
+    }
+  }
+  .interleave <- function(x) {
+    if (!nrow(x) || !"comp_uli" %in% names(x)) {
+      if (nrow(x)) x[, `:=`(pair = .I, row_type = "OUTLIER")]
+      return(x)
+    }
+    x[, pair := .I]
+    x[, row_type := "OUTLIER"]
+    cmp <- x[!is.na(comp_uli),
+             .(pair, row_type = "-> comparator (white, good outcome)",
+               name, lei, screen, loan_cat, group = "white", uli = comp_uli,
+               credit_score = comp_credit_score, dti = comp_dti,
+               ltv_combined = comp_ltv, loan_amount = comp_loan_amount,
+               interest_rate = comp_interest_rate,
+               reason_plain = fifelse(weaker_profile_comparator == 1L,
+                 "COMPARATOR: same CU, same product, equal-or-WEAKER profile -- good outcome",
+                 "COMPARATOR: same CU, same product, closest profile -- good outcome"),
+               match_distance)]
+    spacer <- x[, .(pair, row_type = "zz_spacer")]    # blank line per pair
+    out <- rbind(x, cmp, spacer, fill = TRUE)
+    # explicit ordering key: OUTLIER first, its comparator beneath, spacer
+    # last ("-"(0x2D) < "O"(0x4F) in ASCII, so a plain sort inverts pairs)
+    out[, .ord := fifelse(row_type == "OUTLIER", 1L,
+                  fifelse(startsWith(row_type, "->"), 2L, 3L))]
+    setorder(out, pair, .ord)
+    out[, .ord := NULL]
+    sp_idx <- which(out$row_type == "zz_spacer")   # freeze rows BEFORE the
+    for (cc in setdiff(names(out), "pair"))        # loop clears row_type
+      set(out, i = sp_idx, j = cc, value = NA)
+    # comparator values live on their own row; comp_ columns are redundant
+    dropc <- grep("^comp_", names(out), value = TRUE)
+    if (length(dropc)) out[, (dropc) := NULL]
+    setcolorder(out, c("pair", "row_type"))
+    out
+  }
+  # ---- SUMMARY BUILDER: per stream, so ML gets the same landing pages ----------
+  .mk_summaries <- function(L, FL) {
+    L <- copy(L)
+    # HARDEN TYPES: cross-stream tables arrive via fread, where an all-empty
+    # column reads as logical and fifelse(0, <logical>) errors
+    for (cc in c("resid", "model_expected", "excess_rate_dollars_yr",
+                 "excess_fees_dollars", "weaker_profile_comparator")) {
+      if (!cc %in% names(L)) L[, (cc) := NA_real_]
+      else if (!is.numeric(L[[cc]]))
+        L[, (cc) := suppressWarnings(as.numeric(get(cc)))]
+    }
+    for (cc in c("surprise_level", "rebuttal_evidence", "group")) {
+      if (!cc %in% names(L)) L[, (cc) := ""]
+      else if (!is.character(L[[cc]])) L[, (cc) := as.character(get(cc))]
+    }
+  # ---- SUMMARY TAB: the examiner's landing page --------------------------------
+  smy <- L[, .(
+      total_outliers   = .N,
+      denials          = sum(screen == "denial"),
+      withdrawals      = sum(screen == "withdrawal"),
+      pricing          = sum(screen == "pricing"),
+      steering         = sum(screen == "steering"),
+      extreme_cases    = sum(grepl("^EXTREME", surprise_level)),
+      contradicted_reasons = if ("rebuttal_evidence" %in% names(L))
+        sum(grepl("^CONTRADICTED", rebuttal_evidence)) else 0L,
+      weaker_profile_pairs = sum(weaker_profile_comparator %in% 1L),
+      excess_dollars_yr = sum(excess_rate_dollars_yr, na.rm = TRUE) +
+                          sum(excess_fees_dollars, na.rm = TRUE),
+      groups_affected  = paste(sort(unique(group)), collapse = ", ")),
+    by = .(lei, name)]
+  fl_cu <- FL[, .(minority_records = sum(n_g, na.rm = TRUE),
+                     high_tier_cells = sum(tier == "high", na.rm = TRUE),
+                     strongest_q = suppressWarnings(min(q, na.rm = TRUE))),
+                 by = lei]
+  smy <- merge(smy, fl_cu, by = "lei", all.x = TRUE)
+  smy <- merge(smy, assets[, .(lei, cu_type, assets_tot)], by = "lei",
+               all.x = TRUE)
+  smy[, outliers_per_1000 := round(1000 * total_outliers /
+                                   pmax(minority_records, 1), 1)]
+  if (file.exists(out("ensemble_rankings_2025.csv"))) {
+    er <- fread(out("ensemble_rankings_2025.csv"),
+                colClasses = list(character = "lei"))
+    smy <- merge(smy, er[, .(lei, robust_loans)], by = "lei", all.x = TRUE)
+  }
+  smy[, charter := c("0" = "Unknown", "1" = "Federal",
+                     "2" = "State")[as.character(cu_type)]]
+  smy[, assets_B := round(assets_tot / 1e9, 2)]
+  setorder(smy, -total_outliers)
+  smy[, rank_overall := .I]
+  smy[, rank_in_charter := frank(-total_outliers, ties.method = "first"),
+      by = cu_type]
+  # (3) enrichments
+  enr <- L[, .(
+      pct_extreme = round(100 * mean(grepl("^EXTREME", surprise_level)), 1),
+      top_group = names(sort(table(group), decreasing = TRUE))[1]),
+    by = lei]
+  den_enr <- L[screen == "denial",
+    .(median_expected_denial_pct = round(100 * median(model_expected,
+                                                      na.rm = TRUE), 1)),
+    by = lei]
+  pri_enr <- L[screen == "pricing",
+    .(avg_excess_bp = round(100 * mean(resid, na.rm = TRUE), 0),
+      avg_excess_dollars_per_loan =
+        round(mean(excess_rate_dollars_yr + fifelse(is.na(excess_fees_dollars),
+                                                    0, excess_fees_dollars),
+                   na.rm = TRUE))), by = lei]
+  for (e in list(enr, den_enr, pri_enr)) smy <- merge(smy, e, by = "lei",
+                                                      all.x = TRUE)
+  keepc <- intersect(c("rank_overall", "rank_in_charter", "name", "charter",
+                       "assets_B", "total_outliers", "denials",
+                       "withdrawals", "pricing", "steering",
+                       if ("robust_loans" %in% names(smy)) "robust_loans",
+                       "outliers_per_1000", "extreme_cases",
+                       "contradicted_reasons", "weaker_profile_pairs",
+                       "excess_dollars_yr", "pct_extreme", "top_group",
+                       "median_expected_denial_pct", "avg_excess_bp",
+                       "avg_excess_dollars_per_loan", "high_tier_cells",
+                       "strongest_q", "groups_affected"), names(smy))
+  smy <- smy[, ..keepc]
+
+  # (1) SEPARATE per-screen ranking sheets
+  scr_sum <- list()
+  for (sc in c("denial", "withdrawal", "pricing")) {
+    z <- L[screen == sc,
+               .(loans = .N,
+                 extreme = sum(grepl("^EXTREME", surprise_level)),
+                 groups = paste(sort(unique(group)), collapse = ", ")),
+               by = .(lei, name)]
+    if (!nrow(z)) { scr_sum[[sc]] <- z; next }
+    if (sc == "denial") {
+      z2 <- L[screen == sc,
+        .(contradicted = sum(grepl("^CONTRADICTED", rebuttal_evidence)),
+          weaker_pairs = sum(weaker_profile_comparator %in% 1L),
+          median_expected_pct = round(100 * median(model_expected,
+                                                   na.rm = TRUE), 1)),
+        by = lei]
+    } else if (sc == "pricing") {
+      z2 <- L[screen == sc,
+        .(avg_excess_bp = round(100 * mean(resid, na.rm = TRUE), 0),
+          total_excess_dollars_yr =
+            sum(excess_rate_dollars_yr, na.rm = TRUE) +
+            sum(excess_fees_dollars, na.rm = TRUE)), by = lei]
+    } else {
+      z2 <- L[screen == sc,
+        .(median_expected_pct = round(100 * median(model_expected,
+                                                   na.rm = TRUE), 1)),
+        by = lei]
+    }
+    z <- merge(z, z2, by = "lei")
+    z <- merge(z, assets[, .(lei, cu_type, assets_tot)], by = "lei",
+               all.x = TRUE)
+    z <- merge(z, FL[screen == sc,
+                        .(minority_records = sum(n_g, na.rm = TRUE),
+                          strongest_q = suppressWarnings(min(q, na.rm = TRUE))),
+                        by = lei], by = "lei", all.x = TRUE)
+    z[, per_1000 := round(1000 * loans / pmax(minority_records, 1), 1)]
+    z[, charter := c("0" = "Unknown", "1" = "Federal",
+                     "2" = "State")[as.character(cu_type)]]
+    setorder(z, -loans)
+    z[, rank := .I]
+    setcolorder(z, intersect(c("rank", "name", "charter", "loans",
+                               "per_1000", "extreme", names(z)), names(z)))
+    z[, c("lei", "cu_type", "assets_tot") := NULL]
+    scr_sum[[sc]] <- z
+  }
+  readme <- rbind(readme, data.table(
+    column = c("SUMMARY: outliers_per_1000", "SUMMARY: extreme_cases",
+               "SUMMARY: contradicted_reasons", "SUMMARY: excess_dollars_yr",
+               "SUMMARY: strongest_q"),
+    what_it_means = c(
+      "Outlier intensity: loans for review per 1,000 minority records tested -- compares institutions of different sizes fairly",
+      "Loans where the model gave the adverse outcome <=5% chance (or 50+ bp pricing excess)",
+      "Denials where the CU's stated reason is contradicted by its OWN approved white borrowers",
+      "Pricing rows: total excess interest per year + excess fees, in dollars",
+      "The single most significant statistical result at this CU (smaller = stronger evidence)")))
+    list(master = smy, denial = scr_sum[["denial"]],
+         withdrawal = scr_sum[["withdrawal"]],
+         pricing = scr_sum[["pricing"]])
+  }
+  # current stream: unsuffixed CSVs (workflow compatibility)
+  if (!workbook_only) {
+    cur <- .mk_summaries(loans, flags)
+    fwrite(cur$master, out("outlier_summary_by_cu_2025.csv"))
+    cat("Summary by CU ->", out("outlier_summary_by_cu_2025.csv"), "\n")
+    for (sc in c("denial", "withdrawal", "pricing"))
+      fwrite(cur[[sc]], out(sprintf("outlier_summary_%s_2025.csv", sc)))
+  }
+  # every stream: suffixed CSVs + its own workbook summary tabs
+  sheets <- list(ReadMe = readme)
+  for (st in names(all_streams)) {
+    fst <- if (file.exists(out(sprintf("flags_%s_2025.csv", st)))) {
+      fread(out(sprintf("flags_%s_2025.csv", st)),
+            colClasses = list(character = "lei"))
+    } else flags
+    sm_st <- if (st == stream_tag) cur
+             else .mk_summaries(all_streams[[st]], fst)
+    fwrite(sm_st$master,
+           out(sprintf("outlier_summary_by_cu_%s_2025.csv", st)))
+    stt <- tools::toTitleCase(st)
+    sheets[[paste(stt, "Summary")]] <- sm_st$master
+    for (sc in c("denial", "withdrawal", "pricing"))
+      sheets[[substr(paste(stt, "Summary", tools::toTitleCase(sc)), 1, 31)]] <-
+        sm_st[[sc]]
+  }
+  for (st in names(all_streams))
+    for (sc in sheet_screens) {
+      nmx <- tools::toTitleCase(paste(st, sc))
+      sheets[[substr(nmx, 1, 31)]] <-
+        .interleave(copy(all_streams[[st]][screen == sc]))
+    }
+  wrote_styled <- FALSE
+  if (have_ox2) {
+    wrote_styled <- tryCatch({
+      wb <- openxlsx2::wb_workbook()
+      for (nm in names(sheets)) {
+        wb <- openxlsx2::wb_add_worksheet(wb, nm)
+        wb <- openxlsx2::wb_add_data(wb, sheet = nm, x = sheets[[nm]],
+                                     na.strings = "")   # blanks, not #N/A
+        if ("row_type" %in% names(sheets[[nm]])) {
+          rt <- sheets[[nm]]$row_type
+          cc <- which(!is.na(rt) & startsWith(rt, "->")) + 1L
+          nc <- ncol(sheets[[nm]])
+          for (r in cc)
+            wb <- openxlsx2::wb_add_fill(wb, sheet = nm,
+                    dims = openxlsx2::wb_dims(rows = r, cols = seq_len(nc)),
+                    color = openxlsx2::wb_color(hex = "FFDCE9F7"))
+        }
+      }
+      openxlsx2::wb_save(wb, out("outlier_loans_2025.xlsx"),
+                         overwrite = TRUE)
+      TRUE
+    }, error = function(e) {
+      cat("!! openxlsx2 save FAILED:", conditionMessage(e),
+          "\n   (trying openxlsx / writexl next)\n"); FALSE })
+    if (wrote_styled)
+      cat("STYLED workbook via openxlsx2 (comparators shaded) ->",
+          out("outlier_loans_2025.xlsx"), "\n")
+  }
+  if (!wrote_styled && have_openxlsx) {
+    wb <- openxlsx::createWorkbook()
+    st_out <- openxlsx::createStyle(textDecoration = "bold")
+    st_cmp <- openxlsx::createStyle(fgFill = "#DCE9F7")
+    for (nm in names(sheets)) {
+      openxlsx::addWorksheet(wb, nm)
+      openxlsx::writeData(wb, nm, sheets[[nm]])
+      if ("row_type" %in% names(sheets[[nm]])) {
+        rt <- sheets[[nm]]$row_type
+        oc <- which(!is.na(rt) & rt == "OUTLIER") + 1L
+        cc <- which(!is.na(rt) & startsWith(rt, "->")) + 1L
+        nc <- ncol(sheets[[nm]])
+        if (length(oc)) openxlsx::addStyle(wb, nm, st_out, rows = oc,
+              cols = seq_len(nc), gridExpand = TRUE, stack = TRUE)
+        if (length(cc)) openxlsx::addStyle(wb, nm, st_cmp, rows = cc,
+              cols = seq_len(nc), gridExpand = TRUE, stack = TRUE)
+      }
+    }
+    wrote_styled <- tryCatch({
+      openxlsx::saveWorkbook(wb, out("outlier_loans_2025.xlsx"),
+                             overwrite = TRUE); TRUE },
+      error = function(e) {
+        cat("!! openxlsx save FAILED:", conditionMessage(e),
+            "\n   (falling back to writexl if available)\n"); FALSE })
+    if (wrote_styled)
+      cat("STYLED workbook (outliers bold, comparators shaded) ->",
+          out("outlier_loans_2025.xlsx"), "\n")
+  }
+  if (!wrote_styled && have_writexl) {
+    writexl::write_xlsx(sheets, out("outlier_loans_2025.xlsx"))
+    cat("Workbook (plain; install.packages('openxlsx') for shading) ->",
+        out("outlier_loans_2025.xlsx"), "\n")
+  }
+  if (!wrote_styled && !have_writexl)
+    cat("!! WORKBOOK NOT WRITTEN: openxlsx failed and writexl is not",
+        "installed. Run install.packages('writexl') and rerun.\n")
+  if (wrote_styled || have_writexl) {
+    cat("Sheets written:", paste(names(sheets), collapse = ", "), "\n")
+    cat("==> OPEN THIS FILE IN EXCEL:", out("outlier_loans_2025.xlsx"),
+        "\n    (the .csv files are flat exports; the WORKBOOK with",
+        "Summary/ReadMe/per-screen tabs is the .xlsx)\n")
+  }
+} else cat("(NO EXCEL WRITER INSTALLED -- only flat CSVs were produced.\n",
+           "  Run:  install.packages('openxlsx')   (styled workbook)\n",
+           "  or:   install.packages('writexl')    (plain workbook)\n",
+           "  then rerun this script for the multi-tab .xlsx.)\n")
 cat(sprintf("\nStage-2 file: %s outlier loans with underwriting fields -> %s\n",
             format(nrow(loans), big.mark = ","), out("outlier_loans_2025.csv")))
 cat("Per-screen breakdown of exported loan IDs:\n")

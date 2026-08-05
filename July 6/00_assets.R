@@ -43,8 +43,20 @@ year <- 2025
   d
 }
 
-if (file.exists(out(sprintf("cu_assets_%d.csv", year)))) {
-  cat(sprintf("cu_assets_%d.csv already present\n", year))
+.af <- out(sprintf("cu_assets_%d.csv", year))
+.fresh <- FALSE
+if (file.exists(.af)) {
+  .chk <- fread(.af, nrows = 5000)
+  if (!"cu_type" %in% names(.chk)) {
+    cat("cu_assets file exists but is STALE (no cu_type column, predates",
+        "the type split) -- REBUILDING it now.\n")
+  } else if (all(.chk$cu_type %in% c(NA, 0L))) {
+    cat("cu_assets file exists but cu_type is all NA/0 -- REBUILDING",
+        "(the OCE pull will be re-read; check the warning if it repeats).\n")
+  } else .fresh <- TRUE
+}
+if (.fresh) {
+  cat(sprintf("cu_assets_%d.csv already present (cu_type populated)\n", year))
 } else {
   for (f in c(oce_file, xwalk_file)) if (!file.exists(f))
     stop("Not found: ", f, "\nFix the path in settings.R (changes per release).")
