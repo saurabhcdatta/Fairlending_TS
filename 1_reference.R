@@ -34,9 +34,11 @@ if (!exists("out")) source("0_settings.R")   # paths: run/edit 0_settings.R firs
   ua <- paste0("Mozilla/5.0 (Windows NT 10.0; Win64; x64) ",
                "AppleWebKit/537.36 (KHTML, like Gecko) ",
                "Chrome/126.0 Safari/537.36")
-  old_ua <- getOption("HTTPUserAgent")
-  on.exit(options(HTTPUserAgent = old_ua), add = TRUE)
-  options(HTTPUserAgent = ua)
+  old_ua <- getOption("HTTPUserAgent"); old_to <- getOption("timeout")
+  on.exit(options(HTTPUserAgent = old_ua, timeout = old_to), add = TRUE)
+  options(HTTPUserAgent = ua, timeout = 20)   # cap EACH attempt at ~20s so a
+                                              # black-holed proxy cannot hang
+                                              # the session for minutes
   methods <- c("default", if (.Platform$OS.type == "windows") "wininet",
                "libcurl", if (nzchar(Sys.which("curl"))) "curlexe")
   for (m in methods) {
@@ -44,7 +46,8 @@ if (!exists("out")) source("0_settings.R")   # paths: run/edit 0_settings.R firs
       if (m == "curlexe")
         download.file(url, dest, mode = "wb", quiet = TRUE, method = "curl",
                       extra = paste0(
-          "-L --fail --compressed -A \"", ua, "\" ",
+          "-L --fail --compressed --connect-timeout 10 --max-time 20 ",
+          "-A \"", ua, "\" ",
           "-e \"https://www.nber.org/\" ",
           "-H \"Accept: text/html,application/xhtml+xml,application/xml;",
           "q=0.9,*/*;q=0.8\" ",
@@ -176,10 +179,28 @@ if (exists("prior_work_dir") && is.character(prior_work_dir) &&
         free, "and normalizing it now.\n")
     file.rename(out(final), out(free))
   }
-  staged <- raw_names[file.exists(out(raw_names))][1]
+  # tolerant staged lookup: match the actual names ON DISK case-insensitively
+  # and forgive a doubled extension (Windows hides extensions by default, so
+  # renaming to "fredgraph.csv" in Explorer silently creates
+  # "fredgraph.csv.csv" -- an exact-match lookup then walks straight past it
+  # and hangs on the network instead)
+  on_disk <- list.files(work_dir)
+  staged <- NA_character_
+  for (rn in raw_names) {
+    hit <- on_disk[tolower(on_disk) %in%
+                     tolower(c(rn, paste0(rn, ".csv"), paste0(rn, ".txt")))]
+    if (length(hit)) { staged <- hit[1]; break }
+  }
   src <- if (!is.na(staged)) {
     cat(final, "<- normalizing staged file", staged, "\n"); out(staged)
   } else {
+    cat(final, "-- no staged file found (accepted names:",
+        paste(raw_names, collapse = ", "), ")\n")
+    csvs <- grep("(?i)\\.(csv|txt)$", on_disk, value = TRUE, perl = TRUE)
+    if (length(csvs))
+      cat("   csv files actually in work_dir:",
+          paste(head(csvs, 12), collapse = ", "), "\n")
+    cat("   attempting download -- up to ~20s per method on this network...\n")
     tmp <- tempfile(fileext = ".csv")
     if (.grab(url, tmp)) { cat(final, "<- downloaded\n"); tmp } else NA
   }
@@ -275,7 +296,10 @@ msa_d  <- fread(out("msa_crosswalk.csv"), colClasses = list(character = c("fips"
 cat(sprintf("PMMS: %s weekly rows | %s .. %s | rate range %.2f-%.2f\n",
             format(nrow(pmms_d), big.mark = ","), min(pmms_d$date),
             max(pmms_d$date), min(pmms_d$pmms), max(pmms_d$pmms)))
-.chk(pmms_d[, all(pmms > 1 & pmms < 12)], "PMMS rates inside 1-12% (units are %, not bp)")
+.chk(pmms_d[, all(pmms > 0.5 & pmms < 25)],
+     "PMMS in % units, full-history range OK (a bp-scaled file would sit near 650; 1981 peak was 18.63)")
+.chk(pmms_d[date >= as.Date("2024-06-01"), all(pmms > 2 & pmms < 12)],
+     "2024-26 PMMS rates inside 2-12% (the window the rolling join uses)")
 .chk(pmms_d[, !anyNA(date)],              "PMMS dates all parse")
 .chk(min(pmms_d$date) <= as.Date("2025-01-07") &
      max(pmms_d$date) >= as.Date("2025-12-01"),
