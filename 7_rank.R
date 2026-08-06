@@ -234,13 +234,14 @@ for (sc in unique(outliers$screen)) {
 
 # ================== BLOCK 5: STAGE-2 LOAN FILE + WHY-ENGINE ===================
 keep_fields <- intersect(
-  c("uli", "credit_score", "dti", "ltv_combined", "income", "loan_amount",
+  c("lei", "uli", "credit_score", "dti", "ltv_combined", "income", "loan_amount",
     "interest_rate", "rate_spread", "disc_points", "lender_credits",
     "loan_costs", "aus", "broker", "early_bankrupt", "action_type",
     "action_date", "fips", "property_state",
     "denial_reason1", "denial_reason2", "denial_reason3",
     "cs_bin", "dti_bin", "ltv_bin", "income_bin"), names(dat))
-loans <- merge(outliers, dat[, ..keep_fields], by = "uli", all.x = TRUE)
+loans <- merge(outliers, dat[, ..keep_fields], by = c("lei", "uli"),
+               all.x = TRUE)
 
 # WHY, per loan, in plain columns:
 #   model_expected  what the race-blind model predicted for THIS loan
@@ -296,11 +297,11 @@ if (file.exists(cf_file)) {
                     sprintf("pricing interest_rate | %s", loan_cat),
                     NA_character_)))]
   have <- intersect(expl_vars, names(loans))
-  lvsrc <- loans[, c("uli", "mkey", have), with = FALSE]
+  lvsrc <- loans[, c("lei", "uli", "mkey", have), with = FALSE]
   lvsrc[, (have) := lapply(.SD, as.character), .SDcols = have]  # deliberate:
   # levels/dummies are matched as strings against fixest term names, and a
   # pre-coercion keeps melt from warning about mixed factor/numeric types
-  lv <- melt(lvsrc, id.vars = c("uli", "mkey"), variable.name = "var",
+  lv <- melt(lvsrc, id.vars = c("lei", "uli", "mkey"), variable.name = "var",
              value.name = "level", variable.factor = FALSE)
   lv <- merge(lv, cf[, .(model, var, level, estimate)],
               by.x = c("mkey", "var", "level"),
@@ -341,13 +342,13 @@ if (file.exists(cf_file)) {
                                               seq_len(min(.N, 4)),
                                               head(plain_w, 4)),
                                       collapse = "; ")),
-             by = uli]
+             by = .(lei, uli)]
   bad  <- lv[estimate > 0.05][order(-estimate),
              .(risk_factors_present = paste(head(lbl, 2), collapse = "; "),
                risk_plain = paste(head(plain_w, 2), collapse = "; ")),
-             by = uli]
-  loans <- merge(loans, good, by = "uli", all.x = TRUE)
-  loans <- merge(loans, bad,  by = "uli", all.x = TRUE)
+             by = .(lei, uli)]
+  loans <- merge(loans, good, by = c("lei", "uli"), all.x = TRUE)
+  loans <- merge(loans, bad,  by = c("lei", "uli"), all.x = TRUE)
   for (cc in c("outlier_reason", "reason_plain", "risk_factors_present",
                "risk_plain"))
     if (cc %in% names(loans)) loans[is.na(get(cc)), (cc) := ""]
@@ -411,7 +412,7 @@ for (sc in intersect(names(pools), unique(loans$screen))) {
         (is.na(pp$ltv_combined[b]) | is.na(oo$ltv_combined[i]) |
            pp$ltv_combined[b] >= oo$ltv_combined[i]))
       comp_rows[[length(comp_rows) + 1L]] <- data.table(
-        uli = oo$uli[i], comp_uli = pp$uli[b],
+        lei = oo$lei[i], uli = oo$uli[i], comp_uli = pp$uli[b],
         comp_credit_score = pp$credit_score[b], comp_dti = pp$dti[b],
         comp_ltv = pp$ltv_combined[b], comp_loan_amount = pp$loan_amount[b],
         comp_interest_rate = pp$interest_rate[b],
@@ -429,7 +430,8 @@ wbench <- pools$denial[, .(med_cs = median(credit_score, na.rm = TRUE),
                            med_ltv = median(ltv_combined, na.rm = TRUE)),
                        by = .(lei, loan_cat)]
 if (length(comp_rows)) {
-  loans <- merge(loans, rbindlist(comp_rows), by = "uli", all.x = TRUE)
+  loans <- merge(loans, rbindlist(comp_rows), by = c("lei", "uli"),
+                 all.x = TRUE)
   cat(sprintf("Matched white comparators attached: %s of %s outliers (%s with equal-or-weaker profiles)\n",
       format(sum(!is.na(loans$comp_uli)), big.mark = ","),
       format(nrow(loans), big.mark = ","),

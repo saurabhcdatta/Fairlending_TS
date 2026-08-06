@@ -166,6 +166,34 @@ wf <- data.table(step = "raw CU applications", rows = n0)
   cat(sprintf("  after %-32s %s rows (%.1f%% of raw)\n", step,
               format(nrow(dat), big.mark = ","), 100 * nrow(dat) / n0))
 }
+# --- ULI dedupe (BEFORE any filters, while file order is still intact) -------
+# Agency combined files can carry resubmitted / duplicated records. Exact
+# duplicate rows collapse to one; ULIs that repeat with CONFLICTING content
+# keep the LAST occurrence (later record in the file = the refiled version).
+# Conflicting rows are left in the environment as `dup_uli` for inspection.
+dat <- unique(dat);           .wf("collapse exact duplicate rows")
+# KEY = (lei, uli), NOT uli alone: partially exempt filers report short NULIs
+# that are unique only WITHIN a lender -- the same NULI at two different CUs
+# is two legitimate loans and must never be collapsed.
+.dup <- duplicated(dat[, .(lei, uli)]) |
+        duplicated(dat[, .(lei, uli)], fromLast = TRUE)
+if (any(.dup)) {
+  dup_uli <- dat[.dup][order(lei, uli)]
+  cat(sprintf(paste0("  !! %s rows repeat %s (lender x loan-id) pairs with",
+                     " conflicting content --\n     keeping the last",
+                     " occurrence (refile assumption); inspect `dup_uli`:\n"),
+              format(nrow(dup_uli), big.mark = ","),
+              format(nrow(unique(dup_uli[, .(lei, uli)])), big.mark = ",")))
+  print(dup_uli[, .(dup_rows = .N), by = lei][order(-dup_rows)][1:min(10, .N)])
+  dat <- dat[!duplicated(dat[, .(lei, uli)], fromLast = TRUE)]
+  .wf("resolve conflicting lender x loan-id (keep last)")
+}
+.nuli <- dat[nchar(uli) < 22, .N]
+if (.nuli) cat(sprintf(
+  paste0("  NULI (partial-exemption) loan ids: %s rows -- unique only within",
+         " a lender;\n  cross-lender collisions are legitimate loans, so ALL",
+         " loan-level keys use (lei, uli).\n"),
+  format(.nuli, big.mark = ",")))
 dat <- dat[!is.na(group)];    .wf("known race/ethnicity")
 dat <- dat[sex %in% 1:2];     .wf("sex reported F/M")
 dat <- dat[loan_amount > 0];  .wf("positive loan amount")
@@ -335,7 +363,8 @@ na_prof <- dat[, lapply(.SD, function(x) round(mean(is.na(x)), 3)),
 print(na_prof)
 .chk(na_prof$credit_score < 0.5, "credit score present for most rows")
 .chk(dat[, uniqueN(lei)] > 1,    "more than one lender in the sample")
-.chk(!anyDuplicated(dat$uli),    "ULIs unique (one row per application)")
+.chk(!anyDuplicated(dat[, .(lei, uli)]),
+     "one row per (lei, uli) -- NULIs may repeat ACROSS lenders by design")
 cat("\nBin coverage (levels with data -- empty bins weaken the models):\n")
 for (b in c("cs_bin", "dti_bin", "ltv_bin", "income_bin"))
   cat(sprintf("  %-11s %d of %d levels populated\n", b,
