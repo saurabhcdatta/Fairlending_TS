@@ -237,7 +237,8 @@ cat(sprintf("Kept %s of %s rows after filters (%.1f%%)\n",
 print(dat[, .N, by = group][order(-N)])
 den_rate <- dat[in_denial_universe == TRUE, mean(denied)]
 wdr_rate <- dat[in_withdrawal_universe == TRUE, mean(withdrawn)]
-cat(sprintf("Denial rate (decisioned apps): %.1f%% | withdrawn: %.1f%%\n",
+cat(sprintf(paste0("Denial rate (decisioned apps, ALL product types,",
+                   " pre-taxonomy): %.1f%% | withdrawn: %.1f%%\n"),
             100 * den_rate, 100 * wdr_rate))
 .chk(den_rate > 0.03 & den_rate < 0.35,
      sprintf("denial rate %.1f%% inside 3-35%% band (real-2025 ref ~15%%)", 100 * den_rate))
@@ -312,6 +313,15 @@ dat[, loan_cat := factor(unname(type_labels[as.character(type)]),
 dat[, originated := as.integer(action_type == 1)]
 cat(sprintf("Popick sample after taxonomy: %s rows\n",
             format(nrow(dat), big.mark = ",")))
+den2 <- dat[in_denial_universe == TRUE, mean(denied)]
+wdr2 <- dat[in_withdrawal_universe == TRUE, mean(withdrawn)]
+cat(sprintf(paste0("Modeling-sample rates (post-taxonomy -- the like-for-like",
+                   " comparison): denial %.1f%%\n  | withdrawn %.1f%%",
+                   "  (prior-vintage refs ~15%% / ~18-19%% were measured",
+                   " here)\n"),
+            100 * den2, 100 * wdr2))
+.chk(den2 > 0.03 & den2 < 0.35,
+     sprintf("post-taxonomy denial rate %.1f%% inside 3-35%% band", 100 * den2))
 print(dat[, .N, by = loan_cat][order(-N)])
 
 # --- 8. lender features: origination counts + offers-other-types -------------------
