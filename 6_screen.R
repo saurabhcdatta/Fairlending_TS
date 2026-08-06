@@ -178,7 +178,8 @@ screen_one <- function(d, resid_col, screen_name) {
   setnames(d, resid_col, ".r")
   w <- d[group == "white", .(mu_w = mean(.r), v_w = var(.r), n_w = .N),
          by = lei]
-  g <- d[group != "white", .(mu_g = mean(.r), v_g = var(.r), n_g = .N),
+  g <- d[group != "white", .(mu_g = mean(.r), v_g = var(.r), n_g = .N,
+                             n_adverse = sum(.r > 0)),
          by = .(lei, cu_number, group)]
   cells <- merge(g, w, by = "lei")[n_g >= min_group & n_w >= min_white]
   cells <- merge(cells, assets[, .(lei, cu_type, peer)], by = "lei")
@@ -305,6 +306,32 @@ ggsave(out("screen_gap_density.png"), p_gaps, width = 9, height = 5, dpi = 150)
      "every flagged cell has a positive (adverse) raw gap")
 .chk(!anyDuplicated(flags[, .(lei, group, screen)]),
      "one row per CU x group x screen")
+# ---- outcome-coherence diagnostic -------------------------------------------
+# A flag's evidence-implied excess (eb_gap x n_g) can never exceed the number
+# of adverse outcomes the group ACTUALLY experienced in the cell. A violation
+# means the "adverse gap" is driven by the BENCHMARK side (white residuals
+# unusually favorable at that CU), not by adverse outcomes to the group --
+# the ENT hispanic-withdrawal artifact of the 2025 vintage (1 withdrawal,
+# implied excess 12). Such flags are listed loudly; set coherence_demote to
+# TRUE to demote them to "watch" (default FALSE preserves the flag set that
+# the validation dossier certified for this vintage).
+coherence_demote <- FALSE
+if ("n_adverse" %in% names(flags)) {
+  incoh <- flags[flag == 1 & screen != "pricing" & !is.na(eb_gap) &
+                 ceiling(pmax(eb_gap, 0) * n_g) > n_adverse]
+  if (nrow(incoh)) {
+    cat("  !! OUTCOME-INCOHERENT flags (implied excess > actual adverse outcomes;\n",
+        "    gap driven by favorable benchmark residuals, not group harm):\n")
+    print(incoh[, .(name, group, screen, n_g, n_adverse,
+                    implied = ceiling(pmax(eb_gap, 0) * n_g))])
+    if (coherence_demote) {
+      flags[incoh, on = .(lei, group, screen),
+            `:=`(tier = "watch", flag = 0L)]
+      cat("  (coherence_demote = TRUE: demoted to watch)\n")
+    }
+  } else cat("  [check OK]   all flags outcome-coherent (implied excess <= actual adverse outcomes)\n")
+}
+
 # ---- floor-sensitivity exhibit ----------------------------------------------
 # Which findings depend on the floor POLICY? Recompute tiers at x0.5 and x2
 # floors from the SAME posteriors -- robust flags survive both; floor-
