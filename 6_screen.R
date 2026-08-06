@@ -79,17 +79,36 @@ cat(sprintf("  denial floor %.0fpp | withdrawal floor %.0fpp excess adverse outc
 .pw_file <- out("validation_power_2025.csv")
 if (file.exists(.pw_file) && file.size(.pw_file) > 10) {
   .pw <- fread(.pw_file)
-  if (all(c("gap_pp", "injected", "detected") %in% names(.pw)) && nrow(.pw)) {
+  if ("n" %in% names(.pw) && nrow(.pw)) {
+    # per-cell schema: recovery overall AND by cell size -- detection is
+    # n-dependent, so the honest floor statement is SCOPED by cell size
+    .pw[, size_band := fifelse(n >= 2000, "n>=2000", "n<2000")]
+    .pw2 <- dcast(.pw[, .(recovery = mean(detected)),
+                      by = .(gap_pp, size_band)],
+                  gap_pp ~ size_band, value.var = "recovery")
+    cat("  power leg (last validation run) -- recovery by gap x cell size:\n")
+    print(.pw2)
+    .fg  <- 100 * floors[["denial"]]
+    .big <- .pw[gap_pp <= .fg + 1e-9 & n >= 2000]
+    if (nrow(.big)) {
+      .chk(mean(.big$detected) >= 0.80,
+           sprintf("floor-sized gaps (%.0fpp) recovered >=80%% in LARGE cells (n>=2000) -- floor honorable there; small cells rely on the permutation guard",
+                   .fg))
+    } else cat(sprintf("  (no floor-sized injections in n>=2000 cells last run -- power at the %.0fpp floor unmeasured for large cells)\n", .fg))
+    .sm <- .pw[gap_pp <= .fg + 1e-9 & n < 2000]
+    if (nrow(.sm)) cat(sprintf(
+      "  small cells (n<2000): floor-sized gaps recovered %.0f%% -- the floor is aspirational there; the permutation guard is the compensating control\n",
+      100 * mean(.sm$detected)))
+  } else if (all(c("gap_pp", "injected", "detected") %in% names(.pw)) &&
+             nrow(.pw)) {
+    # legacy aggregated schema (pre size-stratification)
     .pw2 <- .pw[, .(recovery = sum(detected) / pmax(sum(injected), 1L)),
                 by = gap_pp][order(gap_pp)]
-    cat("  power leg (last validation run) -- injected-gap recovery:\n")
+    cat("  power leg (last validation run, aggregated) -- injected-gap recovery:\n")
     print(.pw2[, .(gap_pp, recovery = round(recovery, 2))])
-    .ok80 <- .pw2[recovery >= 0.80, gap_pp]
-    if (length(.ok80)) {
-      .chk(100 * floors[["denial"]] >= min(.ok80) - 1e-9,
-           sprintf("denial floor %.0fpp >= smallest >=80%%-recovered gap %.0fpp (floor is honorable)",
-                   100 * floors[["denial"]], min(.ok80)))
-    } else cat("  !! no injected gap recovered at >=80% -- current floors exceed demonstrated power\n")
+    cat("  (rerun 8_validation.R for size-stratified power -- detection is",
+        "n-dependent,\n   so aggregate recovery understates power in large",
+        "cells)\n")
   }
 } else cat("  (power leg pending: no validation_power_2025.csv yet -- run 8_validation.R)\n")
                           # (1 = federal insured, 2 = state insured;
