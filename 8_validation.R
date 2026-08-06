@@ -50,7 +50,7 @@ if (!file.exists(res_f) || !file.exists(flags_f))
 # ---- backup everything 04a writes; restore on exit ------------------------------
 .bak <- tempfile("val_bak_"); dir.create(.bak)
 .protected <- c("residuals_2025.rds", "flags_2025.csv",
-                "screen_gap_density.png",
+                "screen_gap_density.png", "floor_sensitivity_2025.csv",
                 list.files(out(""), pattern = "^flags_.*_2025\\.csv$"))
 for (f in unique(.protected))
   if (file.exists(out(f))) file.copy(out(f), file.path(.bak, f))
