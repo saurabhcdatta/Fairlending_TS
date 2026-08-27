@@ -98,8 +98,9 @@ residual_gaps <- function(d) {
   pred <- if (kind == "logit") predict(m, newdata = d, type = "response")
           else predict(m, newdata = d)
   na_share <- mean(is.na(pred))
-  fit_stat <- unname(if (kind == "logit") 1 - m$deviance / m$null.deviance
-                     else suppressWarnings(r2(m, "r2")))
+  fit_stat <- unname(if (kind == "logit") suppressWarnings(r2(m, "pr2"))
+                     else suppressWarnings(r2(m, "r2")))   # fixest McFadden
+
   if (!length(fit_stat) || !is.finite(fit_stat)) fit_stat <- NA_real_
   cat(sprintf("  [%s] n=%s | %s=%.3f | mean(pred)=%.4f vs mean(y)=%.4f | pred NA %.1f%%\n",
               label, format(nobs(m), big.mark = ","),

@@ -52,6 +52,65 @@ screen_types <- c(1L, 2L)  # cu_types in the SCREENING universe. Type-3
                            # knob is defense-in-depth so the screen can never
                            # reintroduce them via the assets universe.
 top_n      <- 200         # screen the largest N CUs by assets PER cu_type
+
+# ---- BLOCK 0b: FLOOR CALIBRATION REPORT -------------------------------------
+# The floors above are POLICY and stay fixed across vintages (a floor that
+# moved with each year's data would make flags non-comparable over time).
+# This block documents what the current floors IMPLY and whether the
+# instrument can HONOR them:
+#   harm leg  : PV dollar harm of a pricing gap equal to the floor on a
+#               representative $200k/30yr loan (Popick fn.16 assumptions)
+#   power leg : smallest injected gap the LAST validation run recovered
+#               reliably; a floor below that is a promise the screen cannot
+#               keep (run 8_validation.R to refresh this leg)
+.pv_harm <- function(gap_pp, loan = 200000, term = 360, base_rate = 0.065,
+                     disc_annual = 0.03) {
+  pmt <- function(r) loan * r / (1 - (1 + r)^(-term))
+  ex  <- pmt((base_rate + gap_pp / 100) / 12) - pmt(base_rate / 12)
+  dr  <- disc_annual / 12
+  ex * (1 - (1 + dr)^(-term)) / dr
+}
+cat("== BLOCK 0b: floor calibration report ==\n")
+cat(sprintf("  pricing floor %.2f rate pp -> ~$%s PV harm per affected loan ($200k/30yr)\n",
+            floors[["pricing"]],
+            format(round(.pv_harm(floors[["pricing"]])), big.mark = ",")))
+cat(sprintf("  denial floor %.0fpp | withdrawal floor %.0fpp excess adverse outcomes per 100 applicants\n",
+            100 * floors[["denial"]], 100 * floors[["withdrawal"]]))
+.pw_file <- out("validation_power_2025.csv")
+if (file.exists(.pw_file) && file.size(.pw_file) > 10) {
+  .pw <- fread(.pw_file)
+  if ("n" %in% names(.pw) && nrow(.pw)) {
+    # per-cell schema: recovery overall AND by cell size -- detection is
+    # n-dependent, so the honest floor statement is SCOPED by cell size
+    .pw[, size_band := fifelse(n >= 2000, "n>=2000", "n<2000")]
+    .pw2 <- dcast(.pw[, .(recovery = mean(detected)),
+                      by = .(gap_pp, size_band)],
+                  gap_pp ~ size_band, value.var = "recovery")
+    cat("  power leg (last validation run) -- recovery by gap x cell size:\n")
+    print(.pw2)
+    .fg  <- 100 * floors[["denial"]]
+    .big <- .pw[gap_pp <= .fg + 1e-9 & n >= 2000]
+    if (nrow(.big)) {
+      .chk(mean(.big$detected) >= 0.80,
+           sprintf("floor-sized gaps (%.0fpp) recovered >=80%% in LARGE cells (n>=2000) -- floor honorable there; small cells rely on the permutation guard",
+                   .fg))
+    } else cat(sprintf("  (no floor-sized injections in n>=2000 cells last run -- power at the %.0fpp floor unmeasured for large cells)\n", .fg))
+    .sm <- .pw[gap_pp <= .fg + 1e-9 & n < 2000]
+    if (nrow(.sm)) cat(sprintf(
+      "  small cells (n<2000): floor-sized gaps recovered %.0f%% -- the floor is aspirational there; the permutation guard is the compensating control\n",
+      100 * mean(.sm$detected)))
+  } else if (all(c("gap_pp", "injected", "detected") %in% names(.pw)) &&
+             nrow(.pw)) {
+    # legacy aggregated schema (pre size-stratification)
+    .pw2 <- .pw[, .(recovery = sum(detected) / pmax(sum(injected), 1L)),
+                by = gap_pp][order(gap_pp)]
+    cat("  power leg (last validation run, aggregated) -- injected-gap recovery:\n")
+    print(.pw2[, .(gap_pp, recovery = round(recovery, 2))])
+    cat("  (rerun 8_validation.R for size-stratified power -- detection is",
+        "n-dependent,\n   so aggregate recovery understates power in large",
+        "cells)\n")
+  }
+} else cat("  (power leg pending: no validation_power_2025.csv yet -- run 8_validation.R)\n")
                           # (1 = federal insured, 2 = state insured;
                           #  screening, peer nulls, shrinkage, BH and tiers
                           #  are all computed WITHIN type)
@@ -119,7 +178,8 @@ screen_one <- function(d, resid_col, screen_name) {
   setnames(d, resid_col, ".r")
   w <- d[group == "white", .(mu_w = mean(.r), v_w = var(.r), n_w = .N),
          by = lei]
-  g <- d[group != "white", .(mu_g = mean(.r), v_g = var(.r), n_g = .N),
+  g <- d[group != "white", .(mu_g = mean(.r), v_g = var(.r), n_g = .N,
+                             n_adverse = sum(.r > 0)),
          by = .(lei, cu_number, group)]
   cells <- merge(g, w, by = "lei")[n_g >= min_group & n_w >= min_white]
   cells <- merge(cells, assets[, .(lei, cu_type, peer)], by = "lei")
@@ -246,5 +306,73 @@ ggsave(out("screen_gap_density.png"), p_gaps, width = 9, height = 5, dpi = 150)
      "every flagged cell has a positive (adverse) raw gap")
 .chk(!anyDuplicated(flags[, .(lei, group, screen)]),
      "one row per CU x group x screen")
+# ---- outcome-coherence diagnostic -------------------------------------------
+# A flag's evidence-implied excess (eb_gap x n_g) can never exceed the number
+# of adverse outcomes the group ACTUALLY experienced in the cell. A violation
+# means the "adverse gap" is driven by the BENCHMARK side (white residuals
+# unusually favorable at that CU), not by adverse outcomes to the group --
+# the ENT hispanic-withdrawal artifact of the 2025 vintage (1 withdrawal,
+# implied excess 12). Such flags are listed loudly; set coherence_demote to
+# TRUE to demote them to "watch" (default FALSE preserves the flag set that
+# the validation dossier certified for this vintage).
+coherence_demote <- FALSE
+if ("n_adverse" %in% names(flags)) {
+  incoh <- flags[flag == 1 & screen != "pricing" & !is.na(eb_gap) &
+                 ceiling(pmax(eb_gap, 0) * n_g) > n_adverse]
+  if (nrow(incoh)) {
+    cat("  !! OUTCOME-INCOHERENT flags (implied excess > actual adverse outcomes;\n",
+        "    gap driven by favorable benchmark residuals, not group harm):\n")
+    print(incoh[, .(name, group, screen, n_g, n_adverse,
+                    implied = ceiling(pmax(eb_gap, 0) * n_g))])
+    if (coherence_demote) {
+      flags[incoh, on = .(lei, group, screen),
+            `:=`(tier = "watch", flag = 0L)]
+      cat("  (coherence_demote = TRUE: demoted to watch)\n")
+    }
+  } else cat("  [check OK]   all flags outcome-coherent (implied excess <= actual adverse outcomes)\n")
+}
+
+# ---- floor-sensitivity exhibit ----------------------------------------------
+# Which findings depend on the floor POLICY? Recompute tiers at x0.5 and x2
+# floors from the SAME posteriors -- robust flags survive both; floor-
+# dependent flags are listed so the policy choice is visible, not buried.
+.tiers_at <- function(mult) {
+  z <- copy(flags)
+  z[, fl2 := unname(floors[screen]) * mult]
+  z[, pm2 := fifelse(post_v > 0,
+        pnorm((fl2 - post_m) / sqrt(post_v), lower.tail = FALSE),
+        as.numeric(post_m >= fl2))]
+  z[, t2 := fcase(
+      q <= fdr_high  & pm2 >= p_mat_high & perm_ok, "high",
+      q <= fdr_q     & pm2 >= p_mat_flag & perm_ok, "flag",
+      q <= fdr_watch & pm2 >= p_mat_flag,           "watch",
+      q <= fdr_q     & pm2 <  p_mat_flag,           "watch",
+      default = "none")]
+  z[, .(lei, group, screen, t2)]
+}
+sens <- merge(flags[, .(lei, name, group, screen, tier, flag)],
+              setnames(.tiers_at(0.5), "t2", "tier_half"),
+              by = c("lei", "group", "screen"))
+sens <- merge(sens, setnames(.tiers_at(2), "t2", "tier_dbl"),
+              by = c("lei", "group", "screen"))
+cat(sprintf("Floor-sensitivity flag counts at x0.5 / x1 / x2 floors: %d / %d / %d\n",
+            sens[tier_half %in% c("high", "flag"), .N],
+            sens[flag == 1, .N],
+            sens[tier_dbl %in% c("high", "flag"), .N]))
+if (nrow(sens[flag == 1 & !tier_dbl %in% c("high", "flag")])) {
+  cat("  floor-DEPENDENT flags (drop if floors doubled):\n")
+  print(sens[flag == 1 & !tier_dbl %in% c("high", "flag"),
+             .(name, group, screen, tier)])
+}
+if (nrow(sens[flag == 0 & tier_half %in% c("high", "flag")])) {
+  cat("  near-miss cells (would flag at half floors):\n")
+  print(sens[flag == 0 & tier_half %in% c("high", "flag"),
+             .(name, group, screen)][1:min(8, .N)])
+}
+.chk(sens[tier_half %in% c("high", "flag"), .N] >= sens[flag == 1, .N],
+     "flag set grows (weakly) as floors shrink -- monotonicity sanity")
+fwrite(sens, out("floor_sensitivity_2025.csv"))
+cat("Saved ->", out("floor_sensitivity_2025.csv"), "\n")
+
 cat("Left in the environment: flags, cells_denial/withdrawal/pricing,",
     "assets, top_uni, res\n")

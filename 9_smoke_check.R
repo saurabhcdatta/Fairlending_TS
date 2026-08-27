@@ -83,6 +83,10 @@ raw$interest_rate <- ifelse(raw$action_type == 1,
                             round(6.5 + spread + 0.6 * menu, 3), NA)
 
 dir.create("/tmp/fake_share", showWarnings = FALSE)
+# plant ULI duplicates: 2 exact copies + 1 conflicting refile (action flips)
+raw <- rbind(raw, raw[c(101, 202), ])                 # exact duplicates
+refile <- raw[303, ]; refile$action_type <- ifelse(refile$action_type == 1, 3, 1)
+raw <- rbind(raw, refile)                             # conflicting duplicate
 write_dta(raw, "/tmp/fake_share/all_agency_hmda_2025_test.dta")
 
 # --- point the chain at the fake data --------------------------------------------
@@ -223,7 +227,8 @@ stopifnot(all(!is.na(a$pmms)),
             mean(a$jumbo[!a$fips %in% sprintf("%05d", 11:12)]))
 cat("reference joins verified: pmms / jumbo / msa\n")
 # cu_type-3 CUs (LEI28/LEI29) must be gone from the ANALYSIS and the screen
-stopifnot(!any(a$lei %in% c("LEI28", "LEI29")),
+stopifnot(!anyDuplicated(a[, .(lei, uli)]),  # dedupe key = lender x loan id
+          !any(a$lei %in% c("LEI28", "LEI29")),
           !any(flags$lei %in% c("LEI28", "LEI29")))
 cat("non-federally insured (type 3) dropped from analysis + screen: OK\n")
 stopifnot(all(!is.na(flags$name)),
